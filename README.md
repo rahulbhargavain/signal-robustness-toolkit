@@ -81,4 +81,4 @@ python -m pytest tests/ -q
 
 ## License
 
-Not yet chosen — treat as all-rights-reserved until a LICENSE file is added.
+This project is licensed under the Apache License 2.0. See the LICENSE file for details.
