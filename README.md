@@ -14,6 +14,19 @@ significant on the whole sample is not the same as a result that's real.**
 | `multiple_comparison_correction.py` | Bonferroni, Holm (step-down, strictly more powerful than plain Bonferroni), and Benjamini-Hochberg FDR — for when you've tested more than one hypothesis and need to know which survivors are real. |
 | `dedup_store.py` | Append-and-dedupe for an incrementally-growing CSV store, keyed on a natural key rather than row position. Closes a real, confirmed dtype-mismatch bug: an integer-looking key (like an exchange's own sequence ID) silently round-trips as `int64` after a CSV reload but stays `str` on a fresh fetch, so `drop_duplicates()` fails to recognize the duplicate across runs. |
 
+### Architecture & Logic Flowcharts
+
+**Walk-Forward Validation Pipeline:**
+<p align="center">
+  <img src="assets/walk_forward_validate_pipeline_v2.svg" alt="Walk Forward Validation Pipeline" width="50%">
+</p>
+
+**Classification Branching Logic:**
+<p align="center">
+  <img src="assets/classify_overfitting_branching_logic.svg" alt="Classification Branching Logic" width="75%">
+</p>
+
+
 ## Why these four, together
 
 They compose. A typical flow in the source pipeline: test a candidate signal → if
