@@ -18,7 +18,7 @@ significant on the whole sample is not the same as a result that's real.**
 
 **Walk-Forward Validation Pipeline:**
 <p align="center">
-  <img src="assets/walk_forward_validate_pipeline_v2.svg" alt="Walk Forward Validation Pipeline" width="100%">
+  <img src="assets/walk_forward_validate_pipeline_v2.svg" alt="Walk Forward Validation Pipeline" width="75%">
 </p>
 
 **Classification Branching Logic:**
