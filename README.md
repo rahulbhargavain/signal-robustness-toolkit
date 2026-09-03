@@ -23,7 +23,7 @@ significant on the whole sample is not the same as a result that's real.**
 
 **Classification Branching Logic:**
 <p align="center">
-  <img src="assets/classify_overfitting_branching_logic.svg" alt="Classification Branching Logic" width="100%">
+  <img src="assets/classify_overfitting_branching_logic.svg" alt="Classification Branching Logic" width="75%">
 </p>
 
 
