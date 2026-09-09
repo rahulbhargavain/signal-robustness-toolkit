@@ -230,6 +230,119 @@ def test_stat_group_diff_insufficient_group_size():
     assert not result.significant
 
 
+# --- apply_purge_embargo(): pure split-filtering tests ---------------------
+
+def test_apply_purge_embargo_noop_when_both_zero():
+    train = pd.DataFrame({"date": pd.date_range("2024-01-01", periods=10, freq="D")})
+    test = pd.DataFrame({"date": pd.date_range("2024-01-11", periods=5, freq="D")})
+    out_train, out_test, n_purged, n_embargoed = wfv.apply_purge_embargo(train, test, "date")
+    assert len(out_train) == 10
+    assert len(out_test) == 5
+    assert n_purged == 0
+    assert n_embargoed == 0
+
+
+def test_apply_purge_embargo_purges_train_rows_near_boundary():
+    """Train rows within `purge_days` of the test window's start have
+    their forward-return outcome bleeding into the test period -- must
+    be dropped, not just flagged."""
+    train = pd.DataFrame({"date": pd.date_range("2024-01-01", periods=20, freq="D")})  # ends 2024-01-20
+    test = pd.DataFrame({"date": pd.date_range("2024-01-21", periods=10, freq="D")})   # starts 2024-01-21
+
+    out_train, out_test, n_purged, n_embargoed = wfv.apply_purge_embargo(
+        train, test, "date", purge_days=5)
+
+    # test_start (01-21) - 5 days = 01-16 is the cutoff; train dates 01-17..01-20 (4 rows) purged.
+    assert n_purged == 4
+    assert n_embargoed == 0
+    assert out_train["date"].max() <= pd.Timestamp("2024-01-16")
+    assert len(out_test) == 10  # test untouched
+
+
+def test_apply_purge_embargo_embargoes_test_rows_near_boundary():
+    train = pd.DataFrame({"date": pd.date_range("2024-01-01", periods=20, freq="D")})
+    test = pd.DataFrame({"date": pd.date_range("2024-01-21", periods=10, freq="D")})  # 01-21..01-30
+
+    out_train, out_test, n_purged, n_embargoed = wfv.apply_purge_embargo(
+        train, test, "date", embargo_days=3)
+
+    # test_start (01-21) + 3 days = 01-24 cutoff; test dates 01-21..01-23 (3 rows) embargoed.
+    assert n_embargoed == 3
+    assert n_purged == 0
+    assert out_test["date"].min() >= pd.Timestamp("2024-01-24")
+    assert len(out_train) == 20  # train untouched
+
+
+def test_apply_purge_embargo_both_together():
+    train = pd.DataFrame({"date": pd.date_range("2024-01-01", periods=20, freq="D")})
+    test = pd.DataFrame({"date": pd.date_range("2024-01-21", periods=10, freq="D")})
+
+    out_train, out_test, n_purged, n_embargoed = wfv.apply_purge_embargo(
+        train, test, "date", purge_days=5, embargo_days=3)
+
+    assert n_purged == 4
+    assert n_embargoed == 3
+    assert len(out_train) == 16
+    assert len(out_test) == 7
+
+
+def test_apply_purge_embargo_empty_test_is_noop():
+    train = pd.DataFrame({"date": pd.date_range("2024-01-01", periods=10, freq="D")})
+    test = pd.DataFrame(columns=["date"])
+    out_train, out_test, n_purged, n_embargoed = wfv.apply_purge_embargo(
+        train, test, "date", purge_days=5, embargo_days=3)
+    assert len(out_train) == 10
+    assert n_purged == 0
+    assert n_embargoed == 0
+
+
+def test_walk_forward_validate_purge_days_reduces_train_and_reports_count():
+    """End-to-end: purge_days=0 (default) leaves a signal's train sample
+    untouched; a real purge_days must both shrink train and report
+    n_purged_train on the result."""
+    n = 100
+    df = pd.DataFrame({
+        "date": pd.date_range("2020-01-01", periods=n, freq="D"),
+        "excess_pct": [2.0] * n,
+    })
+    baseline = wfv.walk_forward_validate(df, "date", lambda d: wfv.stat_vs_zero(d["excess_pct"]))
+    purged = wfv.walk_forward_validate(df, "date", lambda d: wfv.stat_vs_zero(d["excess_pct"]),
+                                        purge_days=10)
+    assert baseline.n_purged_train == 0
+    assert purged.n_purged_train > 0
+    assert purged.train.n < baseline.train.n
+    assert "purged" in purged.reasoning
+
+
+def test_walk_forward_validate_embargo_days_reduces_test_and_reports_count():
+    n = 100
+    df = pd.DataFrame({
+        "date": pd.date_range("2020-01-01", periods=n, freq="D"),
+        "excess_pct": [2.0] * n,
+    })
+    baseline = wfv.walk_forward_validate(df, "date", lambda d: wfv.stat_vs_zero(d["excess_pct"]))
+    embargoed = wfv.walk_forward_validate(df, "date", lambda d: wfv.stat_vs_zero(d["excess_pct"]),
+                                           embargo_days=10)
+    assert baseline.n_embargoed_test == 0
+    assert embargoed.n_embargoed_test > 0
+    assert embargoed.test.n < baseline.test.n
+
+
+def test_walk_forward_validate_purge_can_push_below_min_n_to_insufficient_data():
+    """A purge_days large enough to eat most of train must degrade to
+    INSUFFICIENT_DATA cleanly, not silently run a stat on a near-empty
+    sample."""
+    n = 20
+    df = pd.DataFrame({
+        "date": pd.date_range("2020-01-01", periods=n, freq="D"),
+        "excess_pct": [2.0] * n,
+    })
+    result = wfv.walk_forward_validate(df, "date", lambda d: wfv.stat_vs_zero(d["excess_pct"]),
+                                        purge_days=100, min_n_per_split=8)
+    assert result.verdict == "INSUFFICIENT_DATA"
+    assert result.n_purged_train > 0
+
+
 # --- walk_forward_validate(): full orchestration ----------------------------
 
 def test_walk_forward_validate_insufficient_data():

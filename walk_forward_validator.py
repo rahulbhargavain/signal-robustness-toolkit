@@ -60,6 +60,32 @@ walk-forward split with too few clusters (e.g. a 30%-test window landing
 on only 3 fiscal years) can be flagged as unreliable rather than trusted
 at face value in either direction.
 
+PURGE/EMBARGO: the single chronological split above has NO gap at the
+boundary, so two distinct leakage paths exist that a strict combinatorial
+purged cross-validation (CPCV) scheme would close (see cpcv_validator.py,
+which builds on top of this module's classify_overfitting()/
+apply_purge_embargo() for exactly that reason):
+- PURGE: a train observation near the end of train whose own forward-
+  return window (e.g. a 60d-horizon row dated 10 days before the split)
+  has most of its resolving price action fall INSIDE the test window --
+  that observation's "outcome" is partly determined by data the test
+  split is supposed to be held out from. purge_days (the caller's own
+  forward-return horizon in calendar days) drops any train row whose
+  date + purge_days lands on or after the test window's start, so every
+  remaining train observation's full outcome resolves strictly before
+  test begins.
+- EMBARGO: even a purged train/test boundary can still share short-range
+  serial correlation (a market-regime shock spanning the split date) that
+  purging alone doesn't remove, since purging only enforces "the outcome
+  window doesn't overlap" not "the two periods are independent". embargo_
+  days drops test observations within that many calendar days of the
+  test window's own start, opening a clean gap after the boundary too.
+Both default to 0 (off) -- fully backward compatible; existing callers
+that don't pass them get identical behavior. n_purged_train/n_embargoed_
+test on WalkForwardResult report exactly how many rows each removed, so a
+caller/test can verify the purge/embargo actually fired rather than
+trusting the parameter silently did something.
+
 VERDICT THRESHOLDS -- a reasoned STARTING POINT, not back-tested against
 a labeled corpus of known-overfit vs. known-robust strategies. Reasoning:
 - significance_t=2.0 is NOT a new choice.
@@ -114,6 +140,8 @@ class WalkForwardResult:
     sign_flipped: bool
     verdict: str
     reasoning: str
+    n_purged_train: int = 0  # rows dropped from train by purge_days (0 if purge_days=0, the default)
+    n_embargoed_test: int = 0  # rows dropped from test by embargo_days (0 if embargo_days=0, the default)
 
 
 def chronological_split(df: pd.DataFrame, date_col: str, train_frac: float = DEFAULT_TRAIN_FRAC
@@ -145,6 +173,51 @@ def chronological_split(df: pd.DataFrame, date_col: str, train_frac: float = DEF
             run_start, run_end = int(run_positions[0]), int(run_positions[-1]) + 1
             split_idx = run_start if (split_idx - run_start) <= (run_end - split_idx) else run_end
     return ordered.iloc[:split_idx].copy(), ordered.iloc[split_idx:].copy()
+
+
+def apply_purge_embargo(train_df: pd.DataFrame, test_df: pd.DataFrame, date_col: str,
+                         purge_days: int = 0, embargo_days: int = 0
+                         ) -> tuple[pd.DataFrame, pd.DataFrame, int, int]:
+    """Takes an ALREADY-SPLIT (train_df, test_df) pair (from chronological_
+    split(), unmodified -- kept as a completely separate function rather
+    than folded into chronological_split() itself, since that function's
+    2-tuple return contract is depended on elsewhere) and drops:
+    - PURGE: train rows whose date + purge_days lands on or after the test
+      window's own start -- their forward-return outcome isn't fully
+      resolved before test begins.
+    - EMBARGO: test rows within embargo_days of the test window's own
+      start -- an extra buffer against residual serial correlation across
+      the boundary that purging alone doesn't remove.
+    Both no-ops when the corresponding *_days is 0 (the default), so a
+    caller that doesn't pass them gets back the exact same train_df/test_df
+    it gave -- zero behavior change for every existing walk_forward_
+    validate() call site until it explicitly opts in. Returns
+    (purged_train, embargoed_test, n_purged, n_embargoed) so a caller can
+    verify the filter actually did something rather than trust it blindly."""
+    if test_df.empty or (purge_days <= 0 and embargo_days <= 0):
+        return train_df, test_df, 0, 0
+
+    test_dates = pd.to_datetime(test_df[date_col])
+    test_start = test_dates.min()
+
+    purged_train = train_df
+    n_purged = 0
+    if purge_days > 0 and not train_df.empty:
+        train_dates = pd.to_datetime(train_df[date_col])
+        cutoff = test_start - pd.Timedelta(days=purge_days)
+        keep_mask = (train_dates <= cutoff).to_numpy()
+        n_purged = int((~keep_mask).sum())
+        purged_train = train_df.loc[keep_mask]
+
+    embargoed_test = test_df
+    n_embargoed = 0
+    if embargo_days > 0:
+        embargo_cutoff = test_start + pd.Timedelta(days=embargo_days)
+        keep_mask = (test_dates >= embargo_cutoff).to_numpy()
+        n_embargoed = int((~keep_mask).sum())
+        embargoed_test = test_df.loc[keep_mask]
+
+    return purged_train, embargoed_test, n_purged, n_embargoed
 
 
 def _fit_ols(y: np.ndarray, x: pd.DataFrame, maxlags: int | None, cluster_groups: pd.Series | None):
@@ -300,25 +373,47 @@ def walk_forward_validate(
     train_frac: float = DEFAULT_TRAIN_FRAC,
     min_n_per_split: int = DEFAULT_MIN_N_PER_SPLIT,
     significance_t: float = DEFAULT_SIGNIFICANCE_T,
+    purge_days: int = 0,
+    embargo_days: int = 0,
 ) -> WalkForwardResult:
     """Top-level entry point. stat_fn: Callable[[pd.DataFrame], StatResult]
     -- callers build this as e.g. `lambda d: stat_vs_zero(d["excess_pct"])`
     or `lambda d: stat_group_diff(d["fwd_ret"], d["not_spiking"])`, so this
-    module never needs to know a caller's column names."""
+    module never needs to know a caller's column names.
+
+    purge_days/embargo_days (both default 0/off -- see apply_purge_
+    embargo()'s own docstring for exactly what each removes): pass
+    purge_days equal to your signal's own forward-return horizon in
+    calendar days (e.g. 60 for a "fwd_return_60d_pct" column) to drop
+    train rows whose outcome isn't fully resolved before test begins;
+    pass embargo_days for an extra buffer at the start of test. Omitting
+    both reproduces this function's plain single-split behavior."""
     train_df, test_df = chronological_split(df, date_col, train_frac)
+    n_purged_train, n_embargoed_test = 0, 0
+    if purge_days > 0 or embargo_days > 0:
+        train_df, test_df, n_purged_train, n_embargoed_test = apply_purge_embargo(
+            train_df, test_df, date_col, purge_days=purge_days, embargo_days=embargo_days)
+
     if len(train_df) < min_n_per_split or len(test_df) < min_n_per_split:
         return WalkForwardResult(
             train=StatResult(mean=float("nan"), t_stat=float("nan"), n=len(train_df), significant=False),
             test=StatResult(mean=float("nan"), t_stat=float("nan"), n=len(test_df), significant=False),
             retention_ratio=None, sign_flipped=False, verdict="INSUFFICIENT_DATA",
             reasoning=f"train n={len(train_df)}, test n={len(test_df)} -- need >= {min_n_per_split} per split "
-                      "for either stat to be meaningful.",
+                      "for either stat to be meaningful."
+                      + (f" ({n_purged_train} train row(s) purged, {n_embargoed_test} test row(s) embargoed.)"
+                         if n_purged_train or n_embargoed_test else ""),
+            n_purged_train=n_purged_train, n_embargoed_test=n_embargoed_test,
         )
 
     train_stat = stat_fn(train_df)
     test_stat = stat_fn(test_df)
     verdict, reasoning, retention, sign_flipped = classify_overfitting(
         train_stat, test_stat, significance_t=significance_t)
+
+    if n_purged_train or n_embargoed_test:
+        reasoning += (f" ({n_purged_train} train row(s) purged, {n_embargoed_test} test row(s) embargoed "
+                       "-- see purge_days/embargo_days.)")
 
     # A cluster-robust StatResult with too few distinct clusters in either
     # split is NOT a reliable verdict in either direction (see module
@@ -333,4 +428,5 @@ def walk_forward_validate(
                       "count, so this verdict should be treated as inconclusive, not trusted at face value.")
 
     return WalkForwardResult(train=train_stat, test=test_stat, retention_ratio=retention,
+                              n_purged_train=n_purged_train, n_embargoed_test=n_embargoed_test,
                               sign_flipped=sign_flipped, verdict=verdict, reasoning=reasoning)

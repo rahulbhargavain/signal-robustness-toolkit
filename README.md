@@ -1,6 +1,6 @@
 # signal-robustness-toolkit
 
-Four small, independent, fully-tested Python modules for one recurring problem in
+Five small, independent, fully-tested Python modules for one recurring problem in
 quantitative signal research: **a backtest result that looks statistically
 significant on the whole sample is not the same as a result that's real.**
 
@@ -9,17 +9,20 @@ significant on the whole sample is not the same as a result that's real.**
 
 | Module | Answers |
 |---|---|
-| `walk_forward_validator.py` | Split a backtest chronologically (train/test), recompute the same stat on both halves, and classify the result — `ROBUST` / `MODERATE` / `WEAK` / `OVERFITTED` / `INSUFFICIENT_INSAMPLE_EDGE`. A signal that only "worked" in-sample and evaporates or reverses out-of-sample gets caught here, not published as a finding. |
+| `walk_forward_validator.py` | Split a backtest chronologically (train/test), recompute the same stat on both halves, and classify the result — `ROBUST` / `MODERATE` / `WEAK` / `OVERFITTED` / `INSUFFICIENT_INSAMPLE_EDGE`. A signal that only "worked" in-sample and evaporates or reverses out-of-sample gets caught here, not published as a finding. Also provides `apply_purge_embargo()` — drop train rows whose own forward-return window bleeds into the test period, and an extra buffer at the start of test — for when a signal's horizon is wide enough that a naive split boundary leaks. |
+| `cpcv_validator.py` | A stronger sibling to `walk_forward_validator.py`'s single 70/30 split: Combinatorial Purged Cross-Validation (Lopez de Prado). Partitions the timeline into N groups and evaluates **every** C(N,k) held-out combination (purge/embargo applied at each split's own boundaries), reporting a distribution of verdicts instead of one draw. A single chronological split's verdict can be an artifact of exactly where that one boundary happened to land — CPCV has repeatedly caught cases where it disagreed with the single-split verdict in both directions (overturning a false OVERFITTED, and confirming a real one), so prefer it over the single split when you can afford C(N,k) evaluations of your stat function. Builds directly on `walk_forward_validator.py`'s `StatResult`/`classify_overfitting()`/`apply_purge_embargo()` — not a separate implementation. |
 | `fama_macbeth.py` | For "many entities, few time periods" panels (e.g. ~300 stocks reporting on the same annual cycle, giving ~10-17 true independent cohorts, not thousands of independent stock-events) — pooled OLS understates the real clustering and inflates t-stats 4-5x. Runs one regression per cohort and tests the resulting time series of per-cohort estimates instead. |
 | `multiple_comparison_correction.py` | Bonferroni, Holm (step-down, strictly more powerful than plain Bonferroni), and Benjamini-Hochberg FDR — for when you've tested more than one hypothesis and need to know which survivors are real. |
 | `dedup_store.py` | Append-and-dedupe for an incrementally-growing CSV store, keyed on a natural key rather than row position. Closes a real, confirmed dtype-mismatch bug: an integer-looking key (like an exchange's own sequence ID) silently round-trips as `int64` after a CSV reload but stays `str` on a fresh fetch, so `drop_duplicates()` fails to recognize the duplicate across runs. |
 
-## Why these four, together
+## Why these five, together
 
 They compose. A typical flow in the source pipeline: test a candidate signal → if
-one whole-sample test, run `walk_forward_validator.stat_vs_zero()`; if a
+one whole-sample test, run `walk_forward_validator.stat_vs_zero()`, then either
+`walk_forward_validator.walk_forward_validate()` for a quick single-split check or
+`cpcv_validator.cpcv_validate()` for the stronger multi-path one; if a
 cross-sectional panel, use `fama_macbeth.fama_macbeth_regression()` and *then*
-walk-forward-split the resulting cohort-estimate series; if several signals were
+validate the resulting cohort-estimate series the same way; if several signals were
 screened at once, correct with `multiple_comparison_correction.bonferroni_correction()`
 (or `holm_correction`/`benjamini_hochberg_fdr` when the batch is large and some
 real signal is plausible) before trusting any single one. `dedup_store.py` is the
@@ -37,8 +40,10 @@ trust it), not worth shipping the coupled code here.
 
 ## Usage
 
-Each module is self-contained — copy the one file you need, or all four. No
+Each module is self-contained — copy the one file you need, or all five. No
 `setup.py`/`pyproject.toml` provided; drop them into your own project.
+`cpcv_validator.py` is the one exception to full independence: it imports from
+`walk_forward_validator.py`, so copy both together if you want CPCV.
 
 ```python
 import walk_forward_validator as wfv
@@ -46,9 +51,24 @@ import walk_forward_validator as wfv
 result = wfv.walk_forward_validate(
     df, date_col="date",
     stat_fn=lambda d: wfv.stat_vs_zero(d["excess_pct"]),
+    purge_days=20,  # optional: your signal's own forward-return horizon in calendar days
 )
 print(result.verdict)  # ROBUST / MODERATE / WEAK / OVERFITTED / INSUFFICIENT_INSAMPLE_EDGE / INSUFFICIENT_DATA
 print(result.train.t_stat, result.test.t_stat, result.retention_ratio)
+```
+
+```python
+import cpcv_validator as cpcv
+from walk_forward_validator import stat_vs_zero
+
+result = cpcv.cpcv_validate(
+    df, date_col="date",
+    stat_fn=lambda d: stat_vs_zero(d["excess_pct"]),
+    n_groups=6, n_test_groups=2,  # C(6,2) = 15 evaluated paths
+    purge_days=20, embargo_days=20,
+)
+print(result.overall_verdict)  # ROBUST / MODERATE / WEAK / OVERFITTED / INSUFFICIENT_DATA
+print(result.pct_paths_robust_or_moderate, len(result.paths), result.n_splits_skipped)
 ```
 
 ```python
@@ -77,7 +97,7 @@ append_dedup(new_rows_df, store_path=Path("my_accumulator.csv"), dedup_cols=["id
 python -m pytest tests/ -q
 ```
 
-75 tests, no external services, no API keys, no network access required.
+114 tests, no external services, no API keys, no network access required.
 
 ## License
 
