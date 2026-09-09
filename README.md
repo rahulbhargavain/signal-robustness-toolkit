@@ -104,13 +104,27 @@ from dedup_store import append_dedup
 append_dedup(new_rows_df, store_path=Path("my_accumulator.csv"), dedup_cols=["id"])
 ```
 
+## FP rewrites
+
+Each module has a functional-programming sibling (`walk_forward_validator_fp.py`,
+`cpcv_validator_fp.py`, `fama_macbeth_fp.py`, `multiple_comparison_correction_fp.py`,
+`dedup_store_fp.py`) in `tests_fp/`'s companion set at the repo root. Drop-in
+compatible with the originals -- same public names, signatures, and return types,
+same behavior -- restructured to be immutable throughout (frozen, slotted
+dataclasses) and to express branching decision logic (`classify_overfitting`,
+`classify_cpcv_overall`) as a declarative, ordered rule table evaluated via
+`next(...)` instead of an if/elif ladder. Useful if you want to add a new decision
+rule without touching existing branches, or want the stronger guarantee that a
+`StatResult` computed on one split can never be silently mutated later in a longer
+pipeline. Pick whichever style fits your own codebase; both are maintained.
+
 ## Testing
 
 ```bash
-python -m pytest tests/ -q
+python -m pytest tests/ tests_fp/ -q
 ```
 
-114 tests, no external services, no API keys, no network access required.
+249 tests, no external services, no API keys, no network access required.
 
 ## License
 

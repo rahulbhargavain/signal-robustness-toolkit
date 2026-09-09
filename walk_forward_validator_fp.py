@@ -104,6 +104,8 @@ class WalkForwardResult:
     sign_flipped: bool
     verdict: str
     reasoning: str
+    n_purged_train: int = 0
+    n_embargoed_test: int = 0
 
 
 # --------------------------------------------------------------------------
@@ -141,6 +143,47 @@ def chronological_split(
     ordered = df.sort_values(date_col).reset_index(drop=True)
     split_idx = _snap_to_boundary(ordered[date_col], int(len(ordered) * train_frac))
     return ordered.iloc[:split_idx].copy(), ordered.iloc[split_idx:].copy()
+
+
+# --------------------------------------------------------------------------
+# apply_purge_embargo -- pure filter, no mutation of the frames it's given
+# --------------------------------------------------------------------------
+
+def _purge_train(train_df: pd.DataFrame, date_col: str, test_start, purge_days: int) -> tuple[pd.DataFrame, int]:
+    """Pure: returns (kept_train, n_purged) without mutating train_df."""
+    if purge_days <= 0 or train_df.empty:
+        return train_df, 0
+    train_dates = pd.to_datetime(train_df[date_col])
+    cutoff = test_start - pd.Timedelta(days=purge_days)
+    keep_mask = (train_dates <= cutoff).to_numpy()
+    return train_df.loc[keep_mask], int((~keep_mask).sum())
+
+
+def _embargo_test(test_df: pd.DataFrame, test_dates: pd.Series, test_start, embargo_days: int) -> tuple[pd.DataFrame, int]:
+    """Pure: returns (kept_test, n_embargoed) without mutating test_df."""
+    if embargo_days <= 0:
+        return test_df, 0
+    cutoff = test_start + pd.Timedelta(days=embargo_days)
+    keep_mask = (test_dates >= cutoff).to_numpy()
+    return test_df.loc[keep_mask], int((~keep_mask).sum())
+
+
+def apply_purge_embargo(
+    train_df: pd.DataFrame, test_df: pd.DataFrame, date_col: str,
+    purge_days: int = 0, embargo_days: int = 0,
+) -> tuple[pd.DataFrame, pd.DataFrame, int, int]:
+    """Drops train rows whose forward-return window bleeds into the test
+    period (purge_days), and test rows within embargo_days of the test
+    window's own start. Both no-ops when the corresponding *_days is 0.
+    Composed from two pure single-purpose helpers rather than one function
+    doing both jobs -- each is independently testable."""
+    if test_df.empty or (purge_days <= 0 and embargo_days <= 0):
+        return train_df, test_df, 0, 0
+    test_dates = pd.to_datetime(test_df[date_col])
+    test_start = test_dates.min()
+    purged_train, n_purged = _purge_train(train_df, date_col, test_start, purge_days)
+    embargoed_test, n_embargoed = _embargo_test(test_df, test_dates, test_start, embargo_days)
+    return purged_train, embargoed_test, n_purged, n_embargoed
 
 
 # --------------------------------------------------------------------------
@@ -396,6 +439,14 @@ def _append_cluster_caveat(reasoning: str, train_stat: StatResult, test_stat: St
     )
 
 
+def _append_purge_embargo_note(reasoning: str, n_purged_train: int, n_embargoed_test: int) -> str:
+    """Pure: takes a reasoning string, returns a new one. No += mutation."""
+    if not (n_purged_train or n_embargoed_test):
+        return reasoning
+    return reasoning + (f" ({n_purged_train} train row(s) purged, {n_embargoed_test} test row(s) embargoed "
+                         "-- see purge_days/embargo_days.)")
+
+
 def walk_forward_validate(
     df: pd.DataFrame,
     date_col: str,
@@ -403,22 +454,32 @@ def walk_forward_validate(
     train_frac: float = DEFAULT_TRAIN_FRAC,
     min_n_per_split: int = DEFAULT_MIN_N_PER_SPLIT,
     significance_t: float = DEFAULT_SIGNIFICANCE_T,
+    purge_days: int = 0,
+    embargo_days: int = 0,
 ) -> WalkForwardResult:
     train_df, test_df = chronological_split(df, date_col, train_frac)
+    n_purged_train, n_embargoed_test = 0, 0
+    if purge_days > 0 or embargo_days > 0:
+        train_df, test_df, n_purged_train, n_embargoed_test = apply_purge_embargo(
+            train_df, test_df, date_col, purge_days=purge_days, embargo_days=embargo_days)
 
     if len(train_df) < min_n_per_split or len(test_df) < min_n_per_split:
         return WalkForwardResult(
             train=StatResult(mean=float("nan"), t_stat=float("nan"), n=len(train_df), significant=False),
             test=StatResult(mean=float("nan"), t_stat=float("nan"), n=len(test_df), significant=False),
             retention_ratio=None, sign_flipped=False, verdict="INSUFFICIENT_DATA",
-            reasoning=f"train n={len(train_df)}, test n={len(test_df)} -- need >= {min_n_per_split} per split "
-                      "for either stat to be meaningful.",
+            reasoning=_append_purge_embargo_note(
+                f"train n={len(train_df)}, test n={len(test_df)} -- need >= {min_n_per_split} per split "
+                "for either stat to be meaningful.", n_purged_train, n_embargoed_test),
+            n_purged_train=n_purged_train, n_embargoed_test=n_embargoed_test,
         )
 
     train_stat, test_stat = stat_fn(train_df), stat_fn(test_df)
     verdict, reasoning, retention, sign_flipped = classify_overfitting(
         train_stat, test_stat, significance_t=significance_t)
     reasoning = _append_cluster_caveat(reasoning, train_stat, test_stat)
+    reasoning = _append_purge_embargo_note(reasoning, n_purged_train, n_embargoed_test)
 
     return WalkForwardResult(train=train_stat, test=test_stat, retention_ratio=retention,
+                              n_purged_train=n_purged_train, n_embargoed_test=n_embargoed_test,
                               sign_flipped=sign_flipped, verdict=verdict, reasoning=reasoning)
