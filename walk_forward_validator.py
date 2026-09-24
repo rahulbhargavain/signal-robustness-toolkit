@@ -205,7 +205,9 @@ def apply_purge_embargo(train_df: pd.DataFrame, test_df: pd.DataFrame, date_col:
     if purge_days > 0 and not train_df.empty:
         train_dates = pd.to_datetime(train_df[date_col])
         cutoff = test_start - pd.Timedelta(days=purge_days)
-        keep_mask = (train_dates <= cutoff).to_numpy()
+        # Strict: a row dated exactly purge_days before test_start resolves
+        # ON test_start, i.e. "on or after" -- purged, per the docstring.
+        keep_mask = (train_dates < cutoff).to_numpy()
         n_purged = int((~keep_mask).sum())
         purged_train = train_df.loc[keep_mask]
 
@@ -311,6 +313,10 @@ def stat_group_diff(values: pd.Series, group_bool: pd.Series, dates: pd.Series |
     return StatResult(mean=coef, t_stat=t_stat, n=n, significant=abs(t_stat) >= significance_t, n_clusters=n_clusters)
 
 
+def _is_significant(stat: StatResult, significance_t: float) -> bool:
+    return bool(not np.isnan(stat.t_stat) and abs(stat.t_stat) >= significance_t)
+
+
 def classify_overfitting(
     train: StatResult,
     test: StatResult,
@@ -323,11 +329,24 @@ def classify_overfitting(
     each threshold) -- returns (verdict, reasoning, retention_ratio,
     sign_flipped). Deliberately separated from walk_forward_validate() so
     it can be unit-tested directly against synthetic StatResult pairs
-    without building a DataFrame or calling statsmodels."""
-    if not train.significant:
+    without building a DataFrame or calling statsmodels.
+
+    significance_t is AUTHORITATIVE: significance is recomputed here as
+    |t_stat| >= significance_t, not read from StatResult.significant (which
+    stat_fn computed with its own, possibly different, threshold). A test
+    StatResult with a non-finite mean or NaN t_stat (e.g. stat_group_diff() on
+    a split missing one group) is INSUFFICIENT_DATA, not a WEAK verdict."""
+    train_significant = _is_significant(train, significance_t)
+    if not train_significant:
         return ("INSUFFICIENT_INSAMPLE_EDGE",
                 f"train |t|={abs(train.t_stat):.2f} < {significance_t:.1f} -- no real in-sample edge to test "
                 "for overfitting in the first place.",
+                None, False)
+
+    if not np.isfinite(test.mean) or np.isnan(test.t_stat):
+        return ("INSUFFICIENT_DATA",
+                f"test statistic could not be computed (n={test.n}, mean={test.mean}, t={test.t_stat}) -- "
+                "nothing to compare the in-sample edge against.",
                 None, False)
 
     sign_flipped = (train.mean > 0 > test.mean) or (train.mean < 0 < test.mean)
@@ -339,7 +358,7 @@ def classify_overfitting(
 
     retention = (test.mean / train.mean) if train.mean != 0 else None
 
-    if not test.significant:
+    if not _is_significant(test, significance_t):
         if retention is not None and retention < overfit_retention:
             return ("OVERFITTED",
                     f"test |t|={abs(test.t_stat):.2f} < {significance_t:.1f} (not distinguishable from zero) AND "

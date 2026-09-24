@@ -30,6 +30,8 @@ def _ctx(train, test, **overrides):
         train=train, test=test, significance_t=wfv.DEFAULT_SIGNIFICANCE_T,
         robust_retention=wfv.DEFAULT_ROBUST_RETENTION, moderate_retention=wfv.DEFAULT_MODERATE_RETENTION,
         overfit_retention=wfv.DEFAULT_OVERFIT_RETENTION, retention=retention, sign_flipped=sign_flipped,
+        train_significant=wfv._is_significant(train, wfv.DEFAULT_SIGNIFICANCE_T),
+        test_significant=wfv._is_significant(test, wfv.DEFAULT_SIGNIFICANCE_T),
     )
     defaults.update(overrides)
     return wfv._Ctx(**defaults)

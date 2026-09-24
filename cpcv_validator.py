@@ -187,6 +187,21 @@ def _contiguous_runs(sorted_group_ids: list[int]) -> list[list[int]]:
     return runs
 
 
+def _purge_after_run(train_df: pd.DataFrame, date_col: str, run_end, purge_days: int
+                      ) -> tuple[pd.DataFrame, int]:
+    """Drops train rows dated AFTER a held-out run whose date falls within
+    purge_days of the run's last test date -- the mirror image of
+    apply_purge_embargo()'s pre-boundary purge. The last test row's
+    forward-return window runs to run_end + purge_days, so a train row
+    dated inside that window overlaps a test outcome. Train rows dated
+    before the run are left untouched (the pre-boundary purge handles them)."""
+    if purge_days <= 0 or train_df.empty:
+        return train_df, 0
+    train_dates = pd.to_datetime(train_df[date_col])
+    drop_mask = ((train_dates > run_end) & (train_dates <= run_end + pd.Timedelta(days=purge_days))).to_numpy()
+    return train_df.loc[~drop_mask], int(drop_mask.sum())
+
+
 def build_split_frames(df: pd.DataFrame, date_col: str, group_labels: pd.Series,
                         train_groups: frozenset, test_groups: frozenset,
                         purge_days: int = 0, embargo_days: int = 0
@@ -195,17 +210,22 @@ def build_split_frames(df: pd.DataFrame, date_col: str, group_labels: pd.Series,
     applies purge/embargo at EVERY contiguous test-run boundary -- not
     just one, unlike the single chronological-split case. A non-
     contiguous test_groups set (e.g. {1, 3} out of 6) creates two
-    separate contiguous runs ({1} and {3}), each with its own leading/
-    trailing boundary against the surrounding train groups; a train row
-    can be purged by ANY of those boundaries, and a test row can be
-    embargoed at the START of its own run. Reuses walk_forward_validator.
-    apply_purge_embargo() per run rather than reimplementing the purge/
-    embargo arithmetic -- one source of truth for that rule."""
+    separate contiguous runs ({1} and {3}), each with its own leading AND
+    trailing boundary against the surrounding train groups:
+    - LEADING: train rows dated before the run go through walk_forward_
+      validator.apply_purge_embargo() (purges rows whose forward window
+      reaches the run's start; embargoes test rows at the run's start).
+      Only rows dated BEFORE the run are passed in -- apply_purge_embargo()
+      assumes all train precedes test, and handing it later train groups
+      would purge every one of them.
+    - TRAILING: _purge_after_run() drops train rows dated within
+      purge_days after the run's last test date."""
     train_df = df.loc[group_labels.isin(train_groups)]
     test_df = df.loc[group_labels.isin(test_groups)]
     if test_df.empty or (purge_days <= 0 and embargo_days <= 0):
         return train_df, test_df, 0, 0
 
+    train_dates = pd.to_datetime(train_df[date_col])
     runs = _contiguous_runs(sorted(test_groups))
     keep_train_mask = pd.Series(True, index=train_df.index)
     keep_test_mask = pd.Series(True, index=test_df.index)
@@ -215,14 +235,19 @@ def build_split_frames(df: pd.DataFrame, date_col: str, group_labels: pd.Series,
         run_test_df = test_df.loc[group_labels.loc[test_df.index].isin(run)]
         if run_test_df.empty:
             continue
-        run_train_df = train_df.loc[keep_train_mask]
-        purged_train, embargoed_test, n_purged, n_embargoed = apply_purge_embargo(
-            run_train_df, run_test_df, date_col, purge_days=purge_days, embargo_days=embargo_days)
-        dropped_train_idx = run_train_df.index.difference(purged_train.index)
-        dropped_test_idx = run_test_df.index.difference(embargoed_test.index)
-        keep_train_mask.loc[dropped_train_idx] = False
-        keep_test_mask.loc[dropped_test_idx] = False
-        n_purged_total += n_purged
+        run_dates = pd.to_datetime(run_test_df[date_col])
+        run_start, run_end = run_dates.min(), run_dates.max()
+
+        before_train_df = train_df.loc[keep_train_mask & (train_dates < run_start)]
+        purged_before, embargoed_test, n_purged_before, n_embargoed = apply_purge_embargo(
+            before_train_df, run_test_df, date_col, purge_days=purge_days, embargo_days=embargo_days)
+        after_train_df = train_df.loc[keep_train_mask & (train_dates > run_end)]
+        purged_after, n_purged_after = _purge_after_run(after_train_df, date_col, run_end, purge_days)
+
+        keep_train_mask.loc[before_train_df.index.difference(purged_before.index)] = False
+        keep_train_mask.loc[after_train_df.index.difference(purged_after.index)] = False
+        keep_test_mask.loc[run_test_df.index.difference(embargoed_test.index)] = False
+        n_purged_total += n_purged_before + n_purged_after
         n_embargoed_total += n_embargoed
 
     return train_df.loc[keep_train_mask], test_df.loc[keep_test_mask], n_purged_total, n_embargoed_total
