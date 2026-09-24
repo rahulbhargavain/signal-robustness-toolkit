@@ -53,10 +53,21 @@ trust it), not worth shipping the coupled code here.
 
 ## Usage
 
-Each module is self-contained — copy the one file you need, or all five. No
-`setup.py`/`pyproject.toml` provided; drop them into your own project.
-`cpcv_validator.py` is the one exception to full independence: it imports from
+Requires Python 3.10+ with numpy, pandas, scipy and statsmodels (versions in
+`pyproject.toml`). Either install the repo:
+
+```bash
+pip install -e ".[test]"
+```
+
+or copy the one module you need into your own project — each is self-contained.
+`cpcv_validator.py` is the one exception: it imports from
 `walk_forward_validator.py`, so copy both together if you want CPCV.
+
+Significance in the validators uses a two-sided Student-t test at α=0.05 with each
+statistic's own degrees of freedom (n−1, n−2, or G−1 for G clusters) rather than a
+fixed |t| ≥ 2.0, which over-rejects on small splits. Pass `significance_t=2.0` (or
+any float) for a fixed threshold.
 
 ```python
 import walk_forward_validator as wfv
@@ -87,7 +98,11 @@ print(result.pct_paths_robust_or_moderate, len(result.paths), result.n_splits_sk
 ```python
 import fama_macbeth as fmb
 
-result = fmb.fama_macbeth_regression(panel_df, cohort_col="fiscal_year", x_col="characteristic", y_col="forward_return")
+result = fmb.fama_macbeth_regression(
+    panel_df, cohort_col="fiscal_year", x_col="characteristic", y_col="forward_return",
+    min_periods=3,        # fewer usable cohorts -> no t-stat reported (default 3)
+    newey_west_lags=None,  # e.g. 1-2 if adjacent cohorts' forward returns overlap
+)
 print(result.n_periods, result.mean_estimate, result.t_stat, result.p_value)
 ```
 
@@ -108,7 +123,7 @@ append_dedup(new_rows_df, store_path=Path("my_accumulator.csv"), dedup_cols=["id
 
 Each module has a functional-programming sibling (`walk_forward_validator_fp.py`,
 `cpcv_validator_fp.py`, `fama_macbeth_fp.py`, `multiple_comparison_correction_fp.py`,
-`dedup_store_fp.py`) in `tests_fp/`'s companion set at the repo root. Drop-in
+`dedup_store_fp.py`), tested by the matching suite in `tests_fp/`. Drop-in
 compatible with the originals -- same public names, signatures, and return types,
 same behavior -- restructured to be immutable throughout (frozen, slotted
 dataclasses) and to express branching decision logic (`classify_overfitting`,
@@ -121,10 +136,13 @@ pipeline. Pick whichever style fits your own codebase; both are maintained.
 ## Testing
 
 ```bash
-python -m pytest tests/ tests_fp/ -q
+pip install -e ".[test]"
+python -m pytest -q
 ```
 
-287 tests, no external services, no API keys, no network access required.
+425 tests, no external services, no API keys, no network access required.
+GitHub Actions runs the suite on Python 3.10–3.13 for every push to `main` and every
+pull request (`.github/workflows/tests.yml`).
 
 ## License
 

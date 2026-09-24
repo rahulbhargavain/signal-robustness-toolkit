@@ -4,7 +4,8 @@ multiple_comparison_correction.py.
 
 DROP-IN COMPATIBLE: same function names, signatures, and return types
 (list[bool] for the three correction functions, list[dict] for
-summarize_correction). Behavior is unchanged.
+summarize_correction), same behavior (inclusive `p <= threshold`
+rule, matching statsmodels' multipletests).
 
 WHAT CHANGED:
 
@@ -35,7 +36,7 @@ def bonferroni_correction(p_values: list[float], alpha: float = 0.05) -> list[bo
     if not p_values:
         return []
     threshold = alpha / len(p_values)
-    return [p < threshold for p in p_values]
+    return [p <= threshold for p in p_values]
 
 
 def holm_correction(p_values: list[float], alpha: float = 0.05) -> list[bool]:
@@ -54,7 +55,7 @@ def holm_correction(p_values: list[float], alpha: float = 0.05) -> list[bool]:
     # Index of the first rank that fails its threshold -- everything at
     # or after this rank is not rejected. `n` (one past the last valid
     # index) is the default when every rank passes, i.e. nothing fails.
-    first_failure = next((rank for rank in range(n) if sorted_p[rank] >= thresholds[rank]), n)
+    first_failure = next((rank for rank in range(n) if sorted_p[rank] > thresholds[rank]), n)
 
     sorted_significant = np.arange(n) < first_failure
     significant = np.empty(n, dtype=bool)
@@ -100,7 +101,7 @@ def summarize_correction(labels: list[str], p_values: list[float], alpha: float 
         raise ValueError(f"labels ({len(labels)}) and p_values ({len(p_values)}) must be the same length")
     corrected = _CORRECTIONS[method](p_values, alpha)
     return [
-        {"label": label, "p_value": p, "significant_uncorrected": p < alpha,
+        {"label": label, "p_value": p, "significant_uncorrected": p <= alpha,
          "significant_corrected": sig, "method": method, "n_tests": len(p_values)}
         for label, p, sig in zip(labels, p_values, corrected)
     ]

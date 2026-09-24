@@ -1,8 +1,6 @@
 """
-Shared walk-forward robustness/overfitting check.
-Native to this repo: no external MCP/service dependency, pure
-pandas/numpy/statsmodels on whatever DataFrame a backtest script already
-builds.
+Walk-forward robustness/overfitting check. Pure pandas/numpy/statsmodels
+on whatever DataFrame a backtest already builds.
 
 CONCEPT: split a backtest's dated observations chronologically into a
 train window (default first 70%) and a held-out test window (last 30%),
@@ -10,52 +8,41 @@ recompute the SAME summary statistic on each half, and classify how much
 the apparent edge degrades out-of-sample. A signal that only "worked" in
 the training slice and evaporates or reverses in the test slice was
 fit/discovered on noise specific to that period, not a real, stable
-effect -- exactly the failure mode a single whole-history backtest (which
-is how every backtest in this repo up to now has been reported) cannot
+effect -- exactly the failure mode a single whole-history backtest cannot
 by itself distinguish from a genuine edge.
 
-WHY A SINGLE CHRONOLOGICAL SPLIT, NOT ROLLING/EXPANDING WINDOWS: most of
-this repo's backtests have modest sample sizes (tens to low hundreds of
+WHY A SINGLE CHRONOLOGICAL SPLIT, NOT ROLLING/EXPANDING WINDOWS: signal
+backtests often have modest sample sizes (tens to low hundreds of
 observations) -- a rolling-window scheme would slice that down further
-per fold and make each fold's own t-stat too noisy to interpret. A single
-fit/holdout split is also the exact methodology standard scoring
-engine validation settled on for the same reason -- borrowing
-a precedent that was itself chosen after testing IC-weighted vs. rolling
-alternatives and finding the simple split more reliable on a similarly-
-sized panel.
+per fold and make each fold's own t-stat too noisy to interpret. For a
+multi-split check that still keeps folds reasonably large, see
+cpcv_validator.py.
 
-TWO STAT SHAPES SUPPORTED, matching what backtests in this repo actually
-report:
+TWO STAT SHAPES SUPPORTED:
 - stat_vs_zero(): one-sample test -- "is the mean of this return series
-  distinguishable from zero", the shape backtest_mtf_buildup.py and
-  pairs_trading_screen.py's per-trade returns both use.
+  distinguishable from zero" (e.g. per-trade or per-event returns).
 - stat_group_diff(): two-sample test -- "is the mean of group A different
-  from group B", the shape backtest_crude_oil_not_spiking.py's
-  not_spiking-vs-spiking comparison uses.
+  from group B" (e.g. signal-on vs. signal-off forward returns).
 Both support an optional HAC (Newey-West) correction for overlapping
-windows, via the same statsmodels cov_type="HAC" pattern already
-established in backtest_crude_oil_not_spiking.py and
-backtest_momentum_screener_rs.py (maxlags=horizon-1 convention) -- reused
-here, not reinvented, and callers pass dates/maxlags explicitly rather
-than this module guessing an overlap structure it can't know.
+windows via statsmodels' cov_type="HAC" (a common convention is
+maxlags = horizon - 1); callers pass dates/maxlags explicitly rather than
+this module guessing an overlap structure it can't know.
 
-ALSO (added 2026-08-23): an optional CLUSTER-ROBUST correction via
+Both also support an optional CLUSTER-ROBUST correction via
 cluster_groups, for a DIFFERENT overlap shape than HAC handles. HAC/
-Newey-West corrects serial correlation WITHIN one overlapping time series
-(the crude-oil/momentum-screener case). It does NOT correct for many
-DIFFERENT entities' events landing on the same or nearby calendar dates
-and therefore sharing one market-regime shock in their forward returns --
-a cross-sectional panel-clustering problem (Petersen 2009), not a
-time-series autocorrelation one.
+Newey-West corrects serial correlation WITHIN one overlapping time series.
+It does NOT correct for many DIFFERENT entities' events landing on the
+same or nearby calendar dates and therefore sharing one market-regime
+shock in their forward returns -- a cross-sectional panel-clustering
+problem (Petersen 2009), not a time-series autocorrelation one.
 
-Pass cluster_groups (e.g. the exact available_from
-date, or a coarser reporting-year label) instead of dates/maxlags when
-the overlap is cross-sectional like this; the two corrections are NOT
-combined (statsmodels supports two-way cluster+HAC but that's overkill
-for what this repo's backtests need, and untested here) -- pass one or
-the other. cluster-robust SEs are only asymptotically valid with enough
-DISTINCT clusters (~20-30+ is the common rule of thumb); StatResult.
-n_clusters is populated whenever cluster_groups is used so a caller/
+Pass cluster_groups (e.g. the exact event date, or a coarser
+reporting-year label) instead of dates/maxlags when the overlap is
+cross-sectional like this; the two corrections are NOT combined
+(statsmodels supports two-way cluster+HAC, but it is untested here) --
+pass one or the other. Cluster-robust SEs are only asymptotically valid
+with enough DISTINCT clusters (~20-30+ is the common rule of thumb);
+StatResult.n_clusters is populated whenever cluster_groups is used so a
 walk-forward split with too few clusters (e.g. a 30%-test window landing
 on only 3 fiscal years) can be flagged as unreliable rather than trusted
 at face value in either direction.
@@ -88,8 +75,12 @@ trusting the parameter silently did something.
 
 VERDICT THRESHOLDS -- a reasoned STARTING POINT, not back-tested against
 a labeled corpus of known-overfit vs. known-robust strategies. Reasoning:
-- significance_t=2.0 is NOT a new choice.
-  Reused for consistency, not picked fresh.
+- SIGNIFICANCE is a two-sided Student-t test at alpha=0.05 using each
+  statistic's own degrees of freedom (StatResult.df: n-1 for stat_vs_zero,
+  n-2 for stat_group_diff, G-1 for G clusters), not a fixed |t|>=2.0. With
+  min_n_per_split=8 the 5% critical value is 2.36, and with 5 clusters it
+  is 2.78 -- a fixed 2.0 over-rejects badly at exactly the split sizes this
+  module sees. Pass a float significance_t to use a fixed threshold instead.
 - If the TRAIN window itself never reached significance, there was no
   real in-sample edge to test for overfitting -- verdict is
   INSUFFICIENT_INSAMPLE_EDGE, not a robustness grade.
@@ -113,8 +104,10 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
+from scipy import stats
 
-DEFAULT_SIGNIFICANCE_T = 2.0
+DEFAULT_SIGNIFICANCE_ALPHA = 0.05  # two-sided; drives the default small-sample critical t
+DEFAULT_SIGNIFICANCE_T = 2.0  # large-sample rule of thumb; pass as significance_t for a fixed threshold
 DEFAULT_TRAIN_FRAC = 0.7
 DEFAULT_MIN_N_PER_SPLIT = 8
 DEFAULT_ROBUST_RETENTION = 0.7
@@ -130,6 +123,29 @@ class StatResult:
     n: int
     significant: bool
     n_clusters: int | None = None  # populated only when cluster_groups was used
+    df: float | None = None  # degrees of freedom for the critical t; None -> n - 1
+
+
+def critical_t(stat: StatResult, significance_t: float | None = None,
+               alpha: float = DEFAULT_SIGNIFICANCE_ALPHA) -> float:
+    """The |t| a StatResult must reach to count as significant: significance_t
+    when given (fixed threshold), else the two-sided Student-t critical value
+    at alpha with stat.df degrees of freedom (n - 1 if df is unset). Returns
+    inf when there are no degrees of freedom, so nothing is significant."""
+    if significance_t is not None:
+        return float(significance_t)
+    dof = stat.df if stat.df is not None else stat.n - 1
+    if not dof or dof < 1 or np.isnan(dof):
+        return float("inf")
+    return float(stats.t.ppf(1 - alpha / 2, dof))
+
+
+def _dof(n: int, n_params: int, n_clusters: int | None) -> int:
+    """Cluster-robust fits use G - 1 (the usual small-G correction); every
+    other fit uses the residual degrees of freedom n - n_params."""
+    if n_clusters is not None and n_clusters >= 2:
+        return n_clusters - 1
+    return n - n_params
 
 
 @dataclass
@@ -149,14 +165,14 @@ def chronological_split(df: pd.DataFrame, date_col: str, train_frac: float = DEF
     """Sorts by date_col and splits by ROW COUNT (not by calendar span) --
     row-count splitting keeps both halves statistically comparable in
     sample size even when observations aren't evenly spaced in time
-    (e.g. crude-oil's monthly panel vs. a backtest with clustered event
+    (e.g. a regular monthly panel vs. a backtest with clustered event
     dates); a calendar-span split could leave one half with almost no
-    observations if events cluster in time, which is common here.
+    observations if events cluster in time.
 
     SNAPS the split point to the nearest date-value boundary if the naive
     row-count index would land strictly inside a run of TIED dates --
-    the exact same reporting-date shock split
-    across the train/test boundary -- undermining the "test is a genuinely
+    otherwise one date's cohort (one shared shock) would be split across
+    the train/test boundary, undermining the "test is a genuinely
     held-out later period" assumption walk-forward validation depends on,
     on top of (not fixed by) stat_vs_zero/stat_group_diff's cluster_groups
     correction, which only fixes the WITHIN-split i.i.d. assumption, not
@@ -179,9 +195,8 @@ def apply_purge_embargo(train_df: pd.DataFrame, test_df: pd.DataFrame, date_col:
                          purge_days: int = 0, embargo_days: int = 0
                          ) -> tuple[pd.DataFrame, pd.DataFrame, int, int]:
     """Takes an ALREADY-SPLIT (train_df, test_df) pair (from chronological_
-    split(), unmodified -- kept as a completely separate function rather
-    than folded into chronological_split() itself, since that function's
-    2-tuple return contract is depended on elsewhere) and drops:
+    split(), unmodified -- a separate function so chronological_split()
+    keeps its 2-tuple return) and drops:
     - PURGE: train rows whose date + purge_days lands on or after the test
       window's own start -- their forward-return outcome isn't fully
       resolved before test begins.
@@ -190,8 +205,7 @@ def apply_purge_embargo(train_df: pd.DataFrame, test_df: pd.DataFrame, date_col:
       the boundary that purging alone doesn't remove.
     Both no-ops when the corresponding *_days is 0 (the default), so a
     caller that doesn't pass them gets back the exact same train_df/test_df
-    it gave -- zero behavior change for every existing walk_forward_
-    validate() call site until it explicitly opts in. Returns
+    it gave. Returns
     (purged_train, embargoed_test, n_purged, n_embargoed) so a caller can
     verify the filter actually did something rather than trust it blindly."""
     if test_df.empty or (purge_days <= 0 and embargo_days <= 0):
@@ -243,10 +257,8 @@ def _fit_ols(y: np.ndarray, x: pd.DataFrame, maxlags: int | None, cluster_groups
 def _t_from_ols_const(y: np.ndarray, dates: pd.Series | None, maxlags: int | None,
                        cluster_groups: pd.Series | None = None) -> tuple[float, float, int | None]:
     """OLS on a constant-only regressor, optionally HAC- or cluster-robust
-    -corrected -- same pattern as backtest_crude_oil_not_spiking.py's
-    test_horizon_hac() and the fix applied to backtest_momentum_screener_
-    rs.py (must reference the column by its auto-assigned name "const",
-    not a positional index, or statsmodels raises/mis-indexes). `dates`
+    -corrected. The coefficient is read by its column name "const", not a
+    positional index, so statsmodels can't mis-index it. `dates`
     is accepted for signature symmetry with callers that pass it
     alongside maxlags; the fit itself only needs y's own ordering."""
     x = pd.DataFrame({"const": np.ones(len(y))})
@@ -256,7 +268,7 @@ def _t_from_ols_const(y: np.ndarray, dates: pd.Series | None, maxlags: int | Non
 
 def stat_vs_zero(values: pd.Series, dates: pd.Series | None = None, maxlags: int | None = None,
                   cluster_groups: pd.Series | None = None,
-                  significance_t: float = DEFAULT_SIGNIFICANCE_T) -> StatResult:
+                  significance_t: float | None = None) -> StatResult:
     """One-sample test: is mean(values) distinguishable from zero.
     Pass dates+maxlags for a HAC (Newey-West) correction when values come
     from ONE overlapping time series (e.g. monthly forward-return rows
@@ -266,31 +278,28 @@ def stat_vs_zero(values: pd.Series, dates: pd.Series | None = None, maxlags: int
     reporting-season cohort across hundreds of stocks); see module
     docstring for why these are different corrections. Omit all three for
     a plain t-test when observations are already independent (e.g.
-    non-overlapping per-trade returns)."""
-    # REAL BUG FIXED 2026-08-29 (flagged by an external review, verified
-    # live before trusting it): pandas dropna() does NOT remove inf/-inf.
-    # An upstream ratio computation dividing by zero produces inf, which
-    # then propagated silently into mean=inf/t_stat=nan (confirmed live --
-    # not even a clean crash, just a wrong-but-plausible-looking result)
-    # instead of being excluded like a genuinely missing observation.
-    # fama_macbeth.py already guards every regression input this way;
-    # this module was missing the same armor.
+    non-overlapping per-trade returns). significance_t=None (default) uses
+    the small-sample critical t -- see critical_t()."""
+    # dropna() does NOT remove inf/-inf: an upstream divide-by-zero would
+    # otherwise propagate into mean=inf / t_stat=nan instead of being
+    # excluded like a missing observation.
     clean = pd.Series(values).replace([np.inf, -np.inf], np.nan).dropna()
     n = len(clean)
     if n < 2:
         return StatResult(mean=float(clean.mean()) if n else float("nan"), t_stat=float("nan"), n=n, significant=False)
     cg = pd.Series(cluster_groups).loc[clean.index] if cluster_groups is not None else None
     mean, t_stat, n_clusters = _t_from_ols_const(clean.to_numpy(dtype=float), dates, maxlags, cg)
-    return StatResult(mean=mean, t_stat=t_stat, n=n, significant=abs(t_stat) >= significance_t, n_clusters=n_clusters)
+    return _with_significance(StatResult(mean=mean, t_stat=t_stat, n=n, significant=False, n_clusters=n_clusters,
+                                         df=_dof(n, 1, n_clusters)), significance_t)
 
 
 def stat_group_diff(values: pd.Series, group_bool: pd.Series, dates: pd.Series | None = None,
                      maxlags: int | None = None, cluster_groups: pd.Series | None = None,
-                     significance_t: float = DEFAULT_SIGNIFICANCE_T) -> StatResult:
+                     significance_t: float | None = None) -> StatResult:
     """Two-sample test: is mean(values[group_bool]) - mean(values[~group_bool])
-    distinguishable from zero. Same HAC-dummy-regression shape as
-    backtest_crude_oil_not_spiking.py's test_horizon_hac(); see
-    stat_vs_zero()'s docstring for when to use cluster_groups instead of
+    distinguishable from zero, via OLS of values on a group dummy (the
+    dummy's coefficient is the mean difference); see stat_vs_zero()'s
+    docstring for when to use cluster_groups instead of
     dates/maxlags."""
     df = pd.DataFrame({"value": values, "group": group_bool})
     if dates is not None:
@@ -310,17 +319,23 @@ def stat_group_diff(values: pd.Series, group_bool: pd.Series, dates: pd.Series |
     model, n_clusters = _fit_ols(y, x, maxlags, cg)
     coef = float(model.params["group"])
     t_stat = float(model.tvalues["group"])
-    return StatResult(mean=coef, t_stat=t_stat, n=n, significant=abs(t_stat) >= significance_t, n_clusters=n_clusters)
+    return _with_significance(StatResult(mean=coef, t_stat=t_stat, n=n, significant=False, n_clusters=n_clusters,
+                                         df=_dof(n, 2, n_clusters)), significance_t)
 
 
-def _is_significant(stat: StatResult, significance_t: float) -> bool:
-    return bool(not np.isnan(stat.t_stat) and abs(stat.t_stat) >= significance_t)
+def _is_significant(stat: StatResult, significance_t: float | None) -> bool:
+    return bool(not np.isnan(stat.t_stat) and abs(stat.t_stat) >= critical_t(stat, significance_t))
+
+
+def _with_significance(stat: StatResult, significance_t: float | None) -> StatResult:
+    stat.significant = _is_significant(stat, significance_t)
+    return stat
 
 
 def classify_overfitting(
     train: StatResult,
     test: StatResult,
-    significance_t: float = DEFAULT_SIGNIFICANCE_T,
+    significance_t: float | None = None,
     robust_retention: float = DEFAULT_ROBUST_RETENTION,
     moderate_retention: float = DEFAULT_MODERATE_RETENTION,
     overfit_retention: float = DEFAULT_OVERFIT_RETENTION,
@@ -332,14 +347,16 @@ def classify_overfitting(
     without building a DataFrame or calling statsmodels.
 
     significance_t is AUTHORITATIVE: significance is recomputed here as
-    |t_stat| >= significance_t, not read from StatResult.significant (which
-    stat_fn computed with its own, possibly different, threshold). A test
+    |t_stat| >= critical_t(stat, significance_t) -- the small-sample
+    Student-t critical value when significance_t is None -- not read from
+    StatResult.significant (which stat_fn computed with its own, possibly
+    different, threshold). A test
     StatResult with a non-finite mean or NaN t_stat (e.g. stat_group_diff() on
     a split missing one group) is INSUFFICIENT_DATA, not a WEAK verdict."""
-    train_significant = _is_significant(train, significance_t)
-    if not train_significant:
+    train_crit, test_crit = critical_t(train, significance_t), critical_t(test, significance_t)
+    if not _is_significant(train, significance_t):
         return ("INSUFFICIENT_INSAMPLE_EDGE",
-                f"train |t|={abs(train.t_stat):.2f} < {significance_t:.1f} -- no real in-sample edge to test "
+                f"train |t|={abs(train.t_stat):.2f} < {train_crit:.2f} -- no real in-sample edge to test "
                 "for overfitting in the first place.",
                 None, False)
 
@@ -361,12 +378,12 @@ def classify_overfitting(
     if not _is_significant(test, significance_t):
         if retention is not None and retention < overfit_retention:
             return ("OVERFITTED",
-                    f"test |t|={abs(test.t_stat):.2f} < {significance_t:.1f} (not distinguishable from zero) AND "
+                    f"test |t|={abs(test.t_stat):.2f} < {test_crit:.2f} (not distinguishable from zero) AND "
                     f"retention={retention:.0%} < {overfit_retention:.0%} -- edge collapsed in magnitude AND "
                     "significance.", retention, False)
         retention_str = f"{retention:.0%}" if retention is not None else "n/a"
         return ("WEAK",
-                f"test |t|={abs(test.t_stat):.2f} < {significance_t:.1f} (not distinguishable from zero) even "
+                f"test |t|={abs(test.t_stat):.2f} < {test_crit:.2f} (not distinguishable from zero) even "
                 f"though some magnitude survived (retention={retention_str}) "
                 "-- edge did not survive out-of-sample.", retention, False)
 
@@ -391,7 +408,7 @@ def walk_forward_validate(
     stat_fn,
     train_frac: float = DEFAULT_TRAIN_FRAC,
     min_n_per_split: int = DEFAULT_MIN_N_PER_SPLIT,
-    significance_t: float = DEFAULT_SIGNIFICANCE_T,
+    significance_t: float | None = None,
     purge_days: int = 0,
     embargo_days: int = 0,
 ) -> WalkForwardResult:

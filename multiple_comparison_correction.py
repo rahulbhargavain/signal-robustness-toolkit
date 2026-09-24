@@ -1,29 +1,25 @@
 """
-Multiple-comparison p-value correction (added 2026-08-29) -- generalizes
-the manual Bonferroni correction fama_macbeth.py already applies ad hoc
-(m=6 across the PIT fundamentals signal audit: DeltaROCE/DeltaCCC/
-reinvestment/accruals/leverage/EPS-growth)
-into a reusable, tested, first-class utility any
-future multi-test batch can call directly instead of hand-computing
-0.05/m inline.
+Multiple-comparison p-value correction: Bonferroni, Holm, and
+Benjamini-Hochberg FDR, for when a batch of signals was tested and you
+need to know which survivors are real rather than hand-computing 0.05/m.
 
-WHY NOT purgedcv's Deflated Sharpe Ratio (also evaluated 2026-08-29):
-DSR is fundamentally a Sharpe-ratio-based correction -- it needs a return
-series plus the variance of Sharpe ratios ACROSS the trials tried. Every 
-walk_forward_validator.py evaluates edge via
-a t-stat on a mean return or a group difference, not an annualized
-Sharpe). Wiring in DSR would mean introducing a whole new metric family
-this codebase has never used, purely to feed a correction it doesn't
-otherwise need in that form. This module instead expresses the SAME
-underlying concern (how many things did you try before finding this
-result) in the t-stat/p-value idiom already used throughout
-walk_forward_validator.py and every backtest script's significance
-checks -- Bonferroni, Holm (a strictly more powerful step-down version of
-Bonferroni that should be preferred over it in general), and
-Benjamini-Hochberg FDR (controls the expected FALSE DISCOVERY rate
-instead of the family-wise error rate -- less conservative, appropriate
-when a batch has many related tests and some real signal is plausible,
-matching the ROLLING FACTOR-FAMILY SWEEPS this repo actually runs.
+- Bonferroni: reject p <= alpha/m. Controls the family-wise error rate
+  (probability of ANY false positive in the batch). Most conservative.
+- Holm: step-down Bonferroni. Controls the same family-wise error rate and
+  never rejects fewer hypotheses than Bonferroni, so prefer it in general.
+- Benjamini-Hochberg: controls the expected FALSE DISCOVERY rate instead
+  -- less conservative, appropriate when a batch has many related tests
+  (e.g. a factor-family sweep) and some real signal is plausible.
+
+All three use an inclusive `p <= threshold` rule, matching
+statsmodels.stats.multitest.multipletests (tests check agreement).
+
+WHY NOT the Deflated Sharpe Ratio: DSR is a Sharpe-ratio-based correction
+-- it needs a return series plus the variance of Sharpe ratios ACROSS the
+trials tried. This toolkit evaluates edge via a t-stat on a mean return or
+a group difference, not an annualized Sharpe, so these corrections express
+the same concern (how many things did you try before finding this result)
+in the t-stat/p-value idiom used throughout.
 """
 import numpy as np
 
@@ -33,22 +29,19 @@ def bonferroni_correction(p_values: list[float], alpha: float = 0.05) -> list[bo
     alpha/len(p_values) instead of alpha. Controls the family-wise error
     rate (probability of ANY false positive across the whole batch) --
     appropriate when even one false discovery would be costly (e.g.
-    deciding whether to wire a new signal into a live trim/entry gate)."""
+    deciding whether to trade a new signal live)."""
     if not p_values:
         return []
     threshold = alpha / len(p_values)
-    return [p < threshold for p in p_values]
+    return [p <= threshold for p in p_values]
 
 
 def holm_correction(p_values: list[float], alpha: float = 0.05) -> list[bool]:
-    """Step-down Holm-Bonferroni: strictly more powerful than plain
-    Bonferroni (rejects at least as many, sometimes more) while still
-    controlling the same family-wise error rate -- sort p-values
+    """Step-down Holm-Bonferroni: controls the same family-wise error rate
+    as Bonferroni while never rejecting fewer hypotheses. Sort p-values
     ascending, test the smallest against alpha/m, the next against
-    alpha/(m-1), etc., stopping at the first failure (every p-value after
-    a failure is also rejected-as-not-significant, since Holm's guarantee
-    only holds for the contiguous run of successes from the smallest
-    p-value up)."""
+    alpha/(m-1), etc., and stop at the first one that fails -- it and
+    every larger p-value are not rejected."""
     n = len(p_values)
     if n == 0:
         return []
@@ -56,7 +49,7 @@ def holm_correction(p_values: list[float], alpha: float = 0.05) -> list[bool]:
     significant = np.zeros(n, dtype=bool)
     for rank, idx in enumerate(order):
         threshold = alpha / (n - rank)
-        if p_values[idx] < threshold:
+        if p_values[idx] <= threshold:
             significant[idx] = True
         else:
             break  # Holm stops at the first non-rejection; nothing after it can be rejected either
@@ -97,7 +90,7 @@ def summarize_correction(labels: list[str], p_values: list[float], alpha: float 
                       "fdr_bh": benjamini_hochberg_fdr}[method]
     corrected = correction_fn(p_values, alpha)
     return [
-        {"label": label, "p_value": p, "significant_uncorrected": p < alpha,
+        {"label": label, "p_value": p, "significant_uncorrected": p <= alpha,
          "significant_corrected": sig, "method": method, "n_tests": len(p_values)}
         for label, p, sig in zip(labels, p_values, corrected)
     ]

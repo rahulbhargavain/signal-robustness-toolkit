@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "signal-robustness-toolkit"
+version = "0.1.0"
+description = "Walk-forward / CPCV validation, Fama-MacBeth regression, and multiple-comparison correction for quant signal research."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scipy>=1.10",
+    "statsmodels>=0.14",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools]
+py-modules = [
+    "walk_forward_validator", "walk_forward_validator_fp",
+    "cpcv_validator", "cpcv_validator_fp",
+    "fama_macbeth", "fama_macbeth_fp",
+    "multiple_comparison_correction", "multiple_comparison_correction_fp",
+    "dedup_store", "dedup_store_fp",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "tests_fp"]
+pythonpath = ["."]

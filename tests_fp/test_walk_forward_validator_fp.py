@@ -353,13 +353,12 @@ def test_walk_forward_validate_end_to_end_overfitted_case():
     assert result.sign_flipped
 
 
-# --- cluster-robust correction (added 2026-08-23) ----------------------------
-# Real bug this fixes: backtest_pit_eps_growth.py's 20d alpha result looked
-# "significant" (naive t=7.03, p~=0) purely because ~300 stocks per fiscal
-# year share one reporting-cohort's market-regime shock in their 60-day
-# forward returns -- not because they're independent trials. Confirmed
-# live: clustering by reporting-year cohort collapsed that same result to
-# t=1.46 (not significant). This is a DIFFERENT correction than the
+# --- cluster-robust correction ---------------------------------------------
+# Motivating case: an EPS-growth signal's alpha looked "significant" (naive
+# t=7.03) purely because ~300 stocks per fiscal year share one reporting-
+# cohort's market-regime shock in their 60-day forward returns -- not
+# because they're independent trials. Clustering by reporting-year cohort
+# collapsed that same result to t=1.46 (not significant). This is a DIFFERENT correction than the
 # existing HAC/maxlags path (that fixes autocorrelation within ONE
 # overlapping series; this fixes many entities sharing ONE cohort shock).
 

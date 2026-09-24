@@ -47,7 +47,6 @@ import pandas as pd
 
 from walk_forward_validator_fp import (
     DEFAULT_MIN_N_PER_SPLIT,
-    DEFAULT_SIGNIFICANCE_T,
     StatResult,
     apply_purge_embargo,
     classify_overfitting,
@@ -322,7 +321,7 @@ def classify_cpcv_overall(path_verdicts: list[str],
 
 def _evaluate_one_path(df: pd.DataFrame, date_col: str, group_labels: pd.Series, stat_fn,
                         train_groups: frozenset, test_groups: frozenset,
-                        purge_days: int, embargo_days: int, min_n_per_split: int, significance_t: float
+                        purge_days: int, embargo_days: int, min_n_per_split: int, significance_t: Optional[float]
                         ) -> Optional[CPCVPathResult]:
     """Pure: returns one path's result, or None if it was starved below
     min_n_per_split (the caller counts Nones as skipped)."""
@@ -341,7 +340,7 @@ def cpcv_validate(df: pd.DataFrame, date_col: str, stat_fn,
                    n_groups: int = DEFAULT_N_GROUPS, n_test_groups: int = DEFAULT_N_TEST_GROUPS,
                    purge_days: int = 0, embargo_days: int = 0,
                    min_n_per_split: int = DEFAULT_MIN_N_PER_SPLIT,
-                   significance_t: float = DEFAULT_SIGNIFICANCE_T) -> CPCVResult:
+                   significance_t: Optional[float] = None) -> CPCVResult:
     """Top-level entry point. Same stat_fn contract as walk_forward_
     validate(): Callable[[pd.DataFrame], StatResult]. Evaluates every
     C(n_groups, n_test_groups) combinatorial split, skipping (not
