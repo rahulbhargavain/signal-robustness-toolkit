@@ -1,0 +1,32 @@
+name: claude
+
+# On-demand only: runs when the repo owner mentions @claude in an issue or PR
+# comment. Other people's comments never start a runner and never reach
+# Claude's context (public repo -- prompt-injection surface kept minimal).
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+jobs:
+  claude:
+    if: >
+      contains(github.event.comment.body, '@claude') &&
+      github.event.comment.user.login == 'rahulbhargavain'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          include_comments_by_actor: rahulbhargavain
+          claude_args: "--max-turns 10"
