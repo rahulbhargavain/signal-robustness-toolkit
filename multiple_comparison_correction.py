@@ -24,12 +24,18 @@ in the t-stat/p-value idiom used throughout.
 import numpy as np
 
 
+def _check_alpha(alpha: float) -> None:
+    if not 0 < alpha < 1:
+        raise ValueError(f"alpha must be in (0, 1), got {alpha}")
+
+
 def bonferroni_correction(p_values: list[float], alpha: float = 0.05) -> list[bool]:
     """The simplest, most conservative correction: reject at
     alpha/len(p_values) instead of alpha. Controls the family-wise error
     rate (probability of ANY false positive across the whole batch) --
     appropriate when even one false discovery would be costly (e.g.
     deciding whether to trade a new signal live)."""
+    _check_alpha(alpha)
     if not p_values:
         return []
     threshold = alpha / len(p_values)
@@ -42,6 +48,7 @@ def holm_correction(p_values: list[float], alpha: float = 0.05) -> list[bool]:
     ascending, test the smallest against alpha/m, the next against
     alpha/(m-1), etc., and stop at the first one that fails -- it and
     every larger p-value are not rejected."""
+    _check_alpha(alpha)
     n = len(p_values)
     if n == 0:
         return []
@@ -64,6 +71,7 @@ def benjamini_hochberg_fdr(p_values: list[float], alpha: float = 0.05) -> list[b
     signal is plausible rather than testing a single make-or-break
     decision. Sort ascending, find the largest rank k where
     p_(k) <= (k/m)*alpha, reject that one and everything below it."""
+    _check_alpha(alpha)
     n = len(p_values)
     if n == 0:
         return []
@@ -86,11 +94,14 @@ def summarize_correction(labels: list[str], p_values: list[float], alpha: float 
     to be zipped by hand."""
     if len(labels) != len(p_values):
         raise ValueError(f"labels ({len(labels)}) and p_values ({len(p_values)}) must be the same length")
-    correction_fn = {"bonferroni": bonferroni_correction, "holm": holm_correction,
-                      "fdr_bh": benjamini_hochberg_fdr}[method]
+    corrections = {"bonferroni": bonferroni_correction, "holm": holm_correction,
+                   "fdr_bh": benjamini_hochberg_fdr}
+    if method not in corrections:
+        raise ValueError(f"method must be one of {sorted(corrections)}, got {method!r}")
+    correction_fn = corrections[method]
     corrected = correction_fn(p_values, alpha)
     return [
         {"label": label, "p_value": p, "significant_uncorrected": p <= alpha,
          "significant_corrected": sig, "method": method, "n_tests": len(p_values)}
-        for label, p, sig in zip(labels, p_values, corrected)
+        for label, p, sig in zip(labels, p_values, corrected, strict=True)
     ]

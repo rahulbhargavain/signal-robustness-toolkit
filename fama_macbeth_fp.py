@@ -103,6 +103,8 @@ def _t_test_period_estimates(estimates: pd.Series, significance_alpha: float,
     t_stat/p_value are NaN and nothing is significant: a t-test on 2 or 3
     cohorts is not evidence. newey_west_lags (default None = plain FM SE)
     swaps in a Newey-West SE for serially correlated cohort estimates."""
+    if not 0 < significance_alpha < 1:
+        raise ValueError(f"significance_alpha must be in (0, 1), got {significance_alpha}")
     n = len(estimates)
     if n < 2:
         return float("nan"), float("nan"), float("nan"), float("nan"), False
@@ -190,7 +192,7 @@ def _fit_one_cohort_multi_slopes(
         return None
     y = sub[y_col].astype(float)
     model = sm.OLS(y.to_numpy(), X.to_numpy()).fit()
-    return dict(zip(x_cols, model.params[1:]))  # params[0] is const
+    return dict(zip(x_cols, model.params[1:], strict=True))  # params[0] is const
 
 
 def fama_macbeth_multi_regression(
