@@ -55,15 +55,17 @@ in the repo, which defeats "drop-in."
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import reduce
 from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
+from scipy import stats
 
-DEFAULT_SIGNIFICANCE_T = 2.0
+DEFAULT_SIGNIFICANCE_ALPHA = 0.05  # two-sided; drives the default small-sample critical t
+DEFAULT_SIGNIFICANCE_T = 2.0  # large-sample rule of thumb; pass as significance_t for a fixed threshold
 DEFAULT_TRAIN_FRAC = 0.7
 DEFAULT_MIN_N_PER_SPLIT = 8
 DEFAULT_ROBUST_RETENTION = 0.7
@@ -83,6 +85,7 @@ class StatResult:
     n: int
     significant: bool
     n_clusters: Optional[int] = None
+    df: Optional[float] = None  # degrees of freedom for the critical t; None -> n - 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +97,34 @@ class Verdict:
     reasoning: str
     retention_ratio: Optional[float]
     sign_flipped: bool
+
+
+def critical_t(stat: StatResult, significance_t: Optional[float] = None,
+               alpha: float = DEFAULT_SIGNIFICANCE_ALPHA) -> float:
+    """The |t| a StatResult must reach to count as significant: significance_t
+    when given (fixed threshold), else the two-sided Student-t critical value
+    at alpha with stat.df degrees of freedom (n - 1 if unset); inf when there
+    are no degrees of freedom."""
+    if significance_t is not None:
+        return float(significance_t)
+    dof = stat.df if stat.df is not None else stat.n - 1
+    if not dof or dof < 1 or np.isnan(dof):
+        return float("inf")
+    return float(stats.t.ppf(1 - alpha / 2, dof))
+
+
+def _dof(n: int, n_params: int, n_clusters: Optional[int]) -> int:
+    """G - 1 for a cluster-robust fit, n - n_params otherwise."""
+    return n_clusters - 1 if n_clusters is not None and n_clusters >= 2 else n - n_params
+
+
+def _is_significant(stat: StatResult, significance_t: Optional[float]) -> bool:
+    return bool(not np.isnan(stat.t_stat) and abs(stat.t_stat) >= critical_t(stat, significance_t))
+
+
+def _with_significance(stat: StatResult, significance_t: Optional[float]) -> StatResult:
+    """Pure: a copy of stat with .significant filled in."""
+    return replace(stat, significant=_is_significant(stat, significance_t))
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,7 +274,7 @@ def _clean_series(values) -> pd.Series:
 
 def stat_vs_zero(
     values: pd.Series, dates: Optional[pd.Series] = None, maxlags: Optional[int] = None,
-    cluster_groups: Optional[pd.Series] = None, significance_t: float = DEFAULT_SIGNIFICANCE_T,
+    cluster_groups: Optional[pd.Series] = None, significance_t: Optional[float] = None,
 ) -> StatResult:
     clean = _clean_series(values)
     n = len(clean)
@@ -251,13 +282,14 @@ def stat_vs_zero(
         return StatResult(mean=float(clean.mean()) if n else float("nan"), t_stat=float("nan"), n=n, significant=False)
     cg = pd.Series(cluster_groups).loc[clean.index] if cluster_groups is not None else None
     mean, t_stat, n_clusters = _t_from_ols_const(clean.to_numpy(dtype=float), dates, maxlags, cg)
-    return StatResult(mean=mean, t_stat=t_stat, n=n, significant=abs(t_stat) >= significance_t, n_clusters=n_clusters)
+    return _with_significance(StatResult(mean=mean, t_stat=t_stat, n=n, significant=False, n_clusters=n_clusters,
+                                         df=_dof(n, 1, n_clusters)), significance_t)
 
 
 def stat_group_diff(
     values: pd.Series, group_bool: pd.Series, dates: Optional[pd.Series] = None,
     maxlags: Optional[int] = None, cluster_groups: Optional[pd.Series] = None,
-    significance_t: float = DEFAULT_SIGNIFICANCE_T,
+    significance_t: Optional[float] = None,
 ) -> StatResult:
     df = pd.DataFrame({"value": values, "group": group_bool})
     if dates is not None:
@@ -277,7 +309,8 @@ def stat_group_diff(
     cg = df["_cluster"] if cluster_groups is not None else None
     model, n_clusters = _fit_ols(y, x, maxlags, cg)
     coef, t_stat = float(model.params["group"]), float(model.tvalues["group"])
-    return StatResult(mean=coef, t_stat=t_stat, n=n, significant=abs(t_stat) >= significance_t, n_clusters=n_clusters)
+    return _with_significance(StatResult(mean=coef, t_stat=t_stat, n=n, significant=False, n_clusters=n_clusters,
+                                         df=_dof(n, 2, n_clusters)), significance_t)
 
 
 # --------------------------------------------------------------------------
@@ -288,7 +321,7 @@ def stat_group_diff(
 class _Ctx:
     train: StatResult
     test: StatResult
-    significance_t: float
+    significance_t: Optional[float]
     robust_retention: float
     moderate_retention: float
     overfit_retention: float
@@ -296,10 +329,8 @@ class _Ctx:
     sign_flipped: bool
     train_significant: bool
     test_significant: bool
-
-
-def _is_significant(stat: StatResult, significance_t: float) -> bool:
-    return bool(not np.isnan(stat.t_stat) and abs(stat.t_stat) >= significance_t)
+    train_crit: float
+    test_crit: float
 
 
 def _rule_no_insample_edge(ctx: _Ctx) -> Optional[Verdict]:
@@ -307,7 +338,7 @@ def _rule_no_insample_edge(ctx: _Ctx) -> Optional[Verdict]:
         return None
     return Verdict(
         "INSUFFICIENT_INSAMPLE_EDGE",
-        f"train |t|={abs(ctx.train.t_stat):.2f} < {ctx.significance_t:.1f} -- no real in-sample edge to test "
+        f"train |t|={abs(ctx.train.t_stat):.2f} < {ctx.train_crit:.2f} -- no real in-sample edge to test "
         "for overfitting in the first place.",
         None, False,
     )
@@ -347,7 +378,7 @@ def _rule_test_not_significant(ctx: _Ctx) -> Optional[Verdict]:
     if ctx.retention is not None and ctx.retention < ctx.overfit_retention:
         return Verdict(
             "OVERFITTED",
-            f"test |t|={abs(ctx.test.t_stat):.2f} < {ctx.significance_t:.1f} (not distinguishable from zero) AND "
+            f"test |t|={abs(ctx.test.t_stat):.2f} < {ctx.test_crit:.2f} (not distinguishable from zero) AND "
             f"retention={ctx.retention:.0%} < {ctx.overfit_retention:.0%} -- edge collapsed in magnitude AND "
             "significance.",
             ctx.retention, False,
@@ -355,7 +386,7 @@ def _rule_test_not_significant(ctx: _Ctx) -> Optional[Verdict]:
     retention_str = f"{ctx.retention:.0%}" if ctx.retention is not None else "n/a"
     return Verdict(
         "WEAK",
-        f"test |t|={abs(ctx.test.t_stat):.2f} < {ctx.significance_t:.1f} (not distinguishable from zero) even "
+        f"test |t|={abs(ctx.test.t_stat):.2f} < {ctx.test_crit:.2f} (not distinguishable from zero) even "
         f"though some magnitude survived (retention={retention_str}) "
         "-- edge did not survive out-of-sample.",
         ctx.retention, False,
@@ -421,7 +452,7 @@ _RULES: tuple[Callable[[_Ctx], Optional[Verdict]], ...] = (
 def classify_overfitting(
     train: StatResult,
     test: StatResult,
-    significance_t: float = DEFAULT_SIGNIFICANCE_T,
+    significance_t: Optional[float] = None,
     robust_retention: float = DEFAULT_ROBUST_RETENTION,
     moderate_retention: float = DEFAULT_MODERATE_RETENTION,
     overfit_retention: float = DEFAULT_OVERFIT_RETENTION,
@@ -431,12 +462,15 @@ def classify_overfitting(
     take the first non-None Verdict -- same semantics as the original
     if/elif chain, expressed as data (a tuple of rule functions) instead
     of control flow. significance_t is authoritative: significance is
-    recomputed from each StatResult's t_stat, not read from .significant."""
+    recomputed from each StatResult's t_stat against critical_t() (the
+    small-sample Student-t value when significance_t is None), not read
+    from .significant."""
     sign_flipped = (train.mean > 0 > test.mean) or (train.mean < 0 < test.mean)
     retention = (test.mean / train.mean) if train.mean != 0 else None
     ctx = _Ctx(train, test, significance_t, robust_retention, moderate_retention, overfit_retention,
                retention, sign_flipped,
-               _is_significant(train, significance_t), _is_significant(test, significance_t))
+               _is_significant(train, significance_t), _is_significant(test, significance_t),
+               critical_t(train, significance_t), critical_t(test, significance_t))
     verdict = next(v for rule in _RULES if (v := rule(ctx)) is not None)
     return verdict.label, verdict.reasoning, verdict.retention_ratio, verdict.sign_flipped
 
@@ -475,7 +509,7 @@ def walk_forward_validate(
     stat_fn: Callable[[pd.DataFrame], StatResult],
     train_frac: float = DEFAULT_TRAIN_FRAC,
     min_n_per_split: int = DEFAULT_MIN_N_PER_SPLIT,
-    significance_t: float = DEFAULT_SIGNIFICANCE_T,
+    significance_t: Optional[float] = None,
     purge_days: int = 0,
     embargo_days: int = 0,
 ) -> WalkForwardResult:

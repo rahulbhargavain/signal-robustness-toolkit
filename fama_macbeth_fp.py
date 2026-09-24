@@ -48,6 +48,7 @@ from scipy import stats
 
 DEFAULT_MIN_OBS_PER_COHORT = 10
 DEFAULT_SIGNIFICANCE_ALPHA = 0.05
+DEFAULT_MIN_PERIODS = 3  # below this many cohorts, no t-stat is reported
 
 
 @dataclass
@@ -74,17 +75,42 @@ class FamaMacBethMultiResult:
     dropped_cohorts: list = field(default_factory=list)
 
 
-def _t_test_period_estimates(estimates: pd.Series, significance_alpha: float) -> tuple[float, float, float, float, bool]:
-    """Plain one-sample t-test on the per-cohort estimate series (the
-    Fama-MacBeth standard error), using the exact Student's-t survival
-    function with df=n-1 rather than a fixed |t|>=2.0 heuristic --
-    material at the T=8-15 cohort counts this module typically sees."""
+def _newey_west_se(estimates: pd.Series, lags: int) -> float:
+    """Newey-West (Bartlett-kernel) standard error of the mean of the
+    per-cohort estimate series: sqrt((g0 + 2 * sum_{l=1..L} (1 - l/(L+1)) g_l) / T),
+    g_l the lag-l autocovariance of the demeaned series (divided by T).
+    Use when adjacent cohorts' estimates are serially correlated, e.g.
+    forward-return horizons longer than the cohort spacing."""
+    x = estimates.to_numpy(dtype=float)
+    n = len(x)
+    d = x - x.mean()
+    lrv = float(d @ d) / n
+    for lag in range(1, min(lags, n - 1) + 1):
+        lrv += 2 * (1 - lag / (lags + 1)) * float(d[lag:] @ d[:-lag]) / n
+    return float(np.sqrt(max(lrv, 0.0) / n))
+
+
+def _t_test_period_estimates(estimates: pd.Series, significance_alpha: float,
+                             min_periods: int = DEFAULT_MIN_PERIODS,
+                             newey_west_lags: int | None = None) -> tuple[float, float, float, float, bool]:
+    """One-sample t-test on the per-cohort estimate series (the
+    Fama-MacBeth standard error, std / sqrt(T)), using the exact Student's-t
+    distribution with df=T-1 rather than a fixed |t|>=2.0 heuristic --
+    material at the T=8-15 cohort counts this module typically sees (at
+    T=11 the two-tailed 5% critical value is 2.228, not 2.0).
+
+    Fewer than min_periods cohorts -> mean/std are still reported but
+    t_stat/p_value are NaN and nothing is significant: a t-test on 2 or 3
+    cohorts is not evidence. newey_west_lags (default None = plain FM SE)
+    swaps in a Newey-West SE for serially correlated cohort estimates."""
     n = len(estimates)
     if n < 2:
         return float("nan"), float("nan"), float("nan"), float("nan"), False
     mean = float(estimates.mean())
     std = float(estimates.std(ddof=1))
-    se = std / (n ** 0.5)
+    if n < max(min_periods, 2):
+        return mean, std, float("nan"), float("nan"), False
+    se = _newey_west_se(estimates, newey_west_lags) if newey_west_lags else std / (n ** 0.5)
     if se == 0:
         return mean, std, float("nan"), float("nan"), False
     t_stat = mean / se
@@ -129,6 +155,7 @@ def fama_macbeth_regression(
     df: pd.DataFrame, cohort_col: str, x_col: str, y_col: str,
     min_obs_per_cohort: int = DEFAULT_MIN_OBS_PER_COHORT,
     significance_alpha: float = DEFAULT_SIGNIFICANCE_ALPHA,
+    min_periods: int = DEFAULT_MIN_PERIODS, newey_west_lags: int | None = None,
     winsorize_x_pct: Optional[float] = None,
 ) -> FamaMacBethResult:
     """One OLS(y ~ x) regression per distinct value of cohort_col."""
@@ -140,7 +167,8 @@ def fama_macbeth_regression(
     dropped = [c for c, v in per_cohort.items() if v is None]
 
     period_estimates = pd.Series(slopes)
-    mean, std, t_stat, p_value, significant = _t_test_period_estimates(period_estimates, significance_alpha)
+    mean, std, t_stat, p_value, significant = _t_test_period_estimates(period_estimates, significance_alpha,
+        min_periods, newey_west_lags)
     return FamaMacBethResult(period_estimates=period_estimates, mean_estimate=mean, std_estimate=std,
                               t_stat=t_stat, p_value=p_value, n_periods=len(period_estimates),
                               significant=significant, dropped_cohorts=dropped)
@@ -169,6 +197,7 @@ def fama_macbeth_multi_regression(
     df: pd.DataFrame, cohort_col: str, x_cols: list[str], y_col: str,
     min_obs_per_cohort: int = DEFAULT_MIN_OBS_PER_COHORT,
     significance_alpha: float = DEFAULT_SIGNIFICANCE_ALPHA,
+    min_periods: int = DEFAULT_MIN_PERIODS, newey_west_lags: int | None = None,
 ) -> FamaMacBethMultiResult:
     """The genuine Fama-MacBeth (1973) two-pass shape: one slope PER
     x_col PER cohort, jointly fit, then the same per-column one-sample
@@ -181,7 +210,8 @@ def fama_macbeth_multi_regression(
     dropped = [c for c, v in per_cohort.items() if v is None]
 
     period_estimates = pd.DataFrame.from_dict(kept, orient="index", columns=x_cols)
-    per_col_stats = {col: _t_test_period_estimates(period_estimates[col].dropna(), significance_alpha)
+    per_col_stats = {col: _t_test_period_estimates(period_estimates[col].dropna(), significance_alpha,
+        min_periods, newey_west_lags)
                       for col in x_cols}
     means = {col: s[0] for col, s in per_col_stats.items()}
     stds = {col: s[1] for col, s in per_col_stats.items()}
@@ -221,6 +251,7 @@ def fama_macbeth_group_diff(
     df: pd.DataFrame, cohort_col: str, group_col: str, y_col: str,
     min_obs_per_cohort: int = DEFAULT_MIN_OBS_PER_COHORT,
     significance_alpha: float = DEFAULT_SIGNIFICANCE_ALPHA,
+    min_periods: int = DEFAULT_MIN_PERIODS, newey_west_lags: int | None = None,
 ) -> FamaMacBethResult:
     """Same idea as fama_macbeth_regression() but for a binary group
     comparison per cohort, via the same dummy-OLS shape
@@ -233,7 +264,8 @@ def fama_macbeth_group_diff(
     dropped = [c for c, v in per_cohort.items() if v is None]
 
     period_estimates = pd.Series(estimates)
-    mean, std, t_stat, p_value, significant = _t_test_period_estimates(period_estimates, significance_alpha)
+    mean, std, t_stat, p_value, significant = _t_test_period_estimates(period_estimates, significance_alpha,
+        min_periods, newey_west_lags)
     return FamaMacBethResult(period_estimates=period_estimates, mean_estimate=mean, std_estimate=std,
                               t_stat=t_stat, p_value=p_value, n_periods=len(period_estimates),
                               significant=significant, dropped_cohorts=dropped)

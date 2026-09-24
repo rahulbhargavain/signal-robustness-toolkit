@@ -1,4 +1,5 @@
-"""Append-and-dedup helper
+"""Append-and-dedupe for an incrementally-growing CSV store, keyed on a
+natural key (e.g. an exchange's own sequence id) rather than row position.
 """
 
 import os
@@ -18,15 +19,15 @@ def append_dedup(new_rows: pd.DataFrame, store_path: Path, dedup_cols: list[str]
     empty, in which case it's just whatever was already on disk, or an
     empty frame if there was nothing at all).
 
-    dedup_cols are cast to str on BOTH the existing and new rows before
-    comparing -- see module docstring for the exact dtype-mismatch bug
-    this guards against (a numeric-looking key like NSE's seq_id reloads
-    from CSV as int64 but arrives as str on a fresh fetch, and pandas
-    treats `1` and `"1"` as different values in an object-dtype column).
+    dedup_cols are normalized to str on BOTH the existing and new rows
+    before comparing: a numeric-looking key (e.g. an exchange sequence id)
+    would otherwise reload from CSV as int64 (or float64 once the column
+    holds a missing value) but arrive as str on a fresh fetch, and pandas
+    treats `1`, `1.0` and `"1"` as different values.
 
     verbose=True (default) prints a one-line status summary; set False
     when the caller does its own reporting off the returned DataFrame
-    (e.g. ingest_trendlyne_breadth.py's per-source row/date counts).
+    (e.g. its own per-source row/date counts).
 
     Raises ValueError if any of dedup_cols is missing from the data --
     silently deduping on a subset of the key would merge rows that the

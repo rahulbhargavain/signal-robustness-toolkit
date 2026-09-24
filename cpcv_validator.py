@@ -45,7 +45,6 @@ import pandas as pd
 
 from walk_forward_validator import (
     DEFAULT_MIN_N_PER_SPLIT,
-    DEFAULT_SIGNIFICANCE_T,
     StatResult,
     apply_purge_embargo,
     classify_overfitting,
@@ -297,7 +296,7 @@ def cpcv_validate(df: pd.DataFrame, date_col: str, stat_fn,
                    n_groups: int = DEFAULT_N_GROUPS, n_test_groups: int = DEFAULT_N_TEST_GROUPS,
                    purge_days: int = 0, embargo_days: int = 0,
                    min_n_per_split: int = DEFAULT_MIN_N_PER_SPLIT,
-                   significance_t: float = DEFAULT_SIGNIFICANCE_T) -> CPCVResult:
+                   significance_t: float | None = None) -> CPCVResult:
     """Top-level entry point. Same stat_fn contract as walk_forward_
     validate(): Callable[[pd.DataFrame], StatResult].
 
