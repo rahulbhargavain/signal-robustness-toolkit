@@ -252,10 +252,11 @@ def test_apply_purge_embargo_purges_train_rows_near_boundary():
     out_train, out_test, n_purged, n_embargoed = wfv.apply_purge_embargo(
         train, test, "date", purge_days=5)
 
-    # test_start (01-21) - 5 days = 01-16 is the cutoff; train dates 01-17..01-20 (4 rows) purged.
-    assert n_purged == 4
+    # test_start (01-21) - 5 days = 01-16; a 01-16 row's 5-day outcome resolves ON 01-21 (inside
+    # test), so train dates 01-16..01-20 (5 rows) are purged.
+    assert n_purged == 5
     assert n_embargoed == 0
-    assert out_train["date"].max() <= pd.Timestamp("2024-01-16")
+    assert out_train["date"].max() <= pd.Timestamp("2024-01-15")
     assert len(out_test) == 10  # test untouched
 
 
@@ -280,9 +281,9 @@ def test_apply_purge_embargo_both_together():
     out_train, out_test, n_purged, n_embargoed = wfv.apply_purge_embargo(
         train, test, "date", purge_days=5, embargo_days=3)
 
-    assert n_purged == 4
+    assert n_purged == 5
     assert n_embargoed == 3
-    assert len(out_train) == 16
+    assert len(out_train) == 15
     assert len(out_test) == 7
 
 

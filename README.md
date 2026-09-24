@@ -124,7 +124,7 @@ pipeline. Pick whichever style fits your own codebase; both are maintained.
 python -m pytest tests/ tests_fp/ -q
 ```
 
-249 tests, no external services, no API keys, no network access required.
+287 tests, no external services, no API keys, no network access required.
 
 ## License
 

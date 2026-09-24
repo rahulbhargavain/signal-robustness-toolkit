@@ -38,6 +38,7 @@ original.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import reduce
 from itertools import combinations
 from typing import Optional
 
@@ -166,36 +167,61 @@ def _contiguous_runs(sorted_group_ids: list[int]) -> list[list[int]]:
     return runs
 
 
+def _purge_after_run(train_df: pd.DataFrame, date_col: str, run_end, purge_days: int
+                      ) -> tuple[pd.DataFrame, int]:
+    """Pure: drops train rows dated within purge_days AFTER a held-out
+    run's last test date (the last test row's forward window runs to
+    run_end + purge_days) -- the mirror image of the pre-boundary purge."""
+    if purge_days <= 0 or train_df.empty:
+        return train_df, 0
+    train_dates = pd.to_datetime(train_df[date_col])
+    drop_mask = ((train_dates > run_end) & (train_dates <= run_end + pd.Timedelta(days=purge_days))).to_numpy()
+    return train_df.loc[~drop_mask], int(drop_mask.sum())
+
+
+def _run_drops(train_df: pd.DataFrame, train_dates: pd.Series, run_test_df: pd.DataFrame, date_col: str,
+               purge_days: int, embargo_days: int) -> tuple[pd.Index, pd.Index, int, int]:
+    """Pure: for one contiguous held-out run, returns (train index to drop,
+    test index to drop, n_purged, n_embargoed). Only train rows dated
+    BEFORE the run go through apply_purge_embargo() -- it assumes all train
+    precedes test, and would otherwise purge every later train group."""
+    run_dates = pd.to_datetime(run_test_df[date_col])
+    run_start, run_end = run_dates.min(), run_dates.max()
+    before = train_df.loc[train_dates.loc[train_df.index] < run_start]
+    after = train_df.loc[train_dates.loc[train_df.index] > run_end]
+    kept_before, kept_test, n_before, n_embargoed = apply_purge_embargo(
+        before, run_test_df, date_col, purge_days=purge_days, embargo_days=embargo_days)
+    kept_after, n_after = _purge_after_run(after, date_col, run_end, purge_days)
+    drop_train = before.index.difference(kept_before.index).union(after.index.difference(kept_after.index))
+    return drop_train, run_test_df.index.difference(kept_test.index), n_before + n_after, n_embargoed
+
+
 def build_split_frames(df: pd.DataFrame, date_col: str, group_labels: pd.Series,
                         train_groups: frozenset, test_groups: frozenset,
                         purge_days: int = 0, embargo_days: int = 0
                         ) -> tuple[pd.DataFrame, pd.DataFrame, int, int]:
     """Slices df into (train, test) for one CPCV combinatorial split, then
-    applies purge/embargo at EVERY contiguous test-run boundary. Reuses
-    walk_forward_validator_fp.apply_purge_embargo() per run."""
+    applies purge/embargo at EVERY contiguous test-run boundary, leading
+    (purge + test embargo via walk_forward_validator_fp.apply_purge_embargo())
+    and trailing (_purge_after_run())."""
     train_df = df.loc[group_labels.isin(train_groups)]
     test_df = df.loc[group_labels.isin(test_groups)]
     if test_df.empty or (purge_days <= 0 and embargo_days <= 0):
         return train_df, test_df, 0, 0
 
-    runs = _contiguous_runs(sorted(test_groups))
-    keep_train_mask = pd.Series(True, index=train_df.index)
-    keep_test_mask = pd.Series(True, index=test_df.index)
-    n_purged_total = 0
-    n_embargoed_total = 0
-    for run in runs:
-        run_test_df = test_df.loc[group_labels.loc[test_df.index].isin(run)]
-        if run_test_df.empty:
-            continue
-        run_train_df = train_df.loc[keep_train_mask]
-        purged_train, embargoed_test, n_purged, n_embargoed = apply_purge_embargo(
-            run_train_df, run_test_df, date_col, purge_days=purge_days, embargo_days=embargo_days)
-        keep_train_mask.loc[run_train_df.index.difference(purged_train.index)] = False
-        keep_test_mask.loc[run_test_df.index.difference(embargoed_test.index)] = False
-        n_purged_total += n_purged
-        n_embargoed_total += n_embargoed
+    train_dates = pd.to_datetime(train_df[date_col])
+    test_group_of = group_labels.loc[test_df.index]
+    run_frames = (test_df.loc[test_group_of.isin(run)] for run in _contiguous_runs(sorted(test_groups)))
 
-    return train_df.loc[keep_train_mask], test_df.loc[keep_test_mask], n_purged_total, n_embargoed_total
+    def step(acc, run_test_df):
+        kept_train, drop_test, n_purged, n_embargoed = acc
+        if run_test_df.empty:
+            return acc
+        d_train, d_test, p, e = _run_drops(kept_train, train_dates, run_test_df, date_col, purge_days, embargo_days)
+        return kept_train.drop(index=d_train), drop_test.union(d_test), n_purged + p, n_embargoed + e
+
+    kept_train, drop_test, n_purged, n_embargoed = reduce(step, run_frames, (train_df, pd.Index([]), 0, 0))
+    return kept_train, test_df.drop(index=drop_test), n_purged, n_embargoed
 
 
 def evaluate_split(train_df: pd.DataFrame, test_df: pd.DataFrame, stat_fn) -> tuple[StatResult, StatResult]:

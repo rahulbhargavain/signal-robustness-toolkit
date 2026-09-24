@@ -155,7 +155,9 @@ def _purge_train(train_df: pd.DataFrame, date_col: str, test_start, purge_days: 
         return train_df, 0
     train_dates = pd.to_datetime(train_df[date_col])
     cutoff = test_start - pd.Timedelta(days=purge_days)
-    keep_mask = (train_dates <= cutoff).to_numpy()
+    # Strict: a row dated exactly purge_days before test_start resolves ON
+    # test_start ("on or after") -- purged.
+    keep_mask = (train_dates < cutoff).to_numpy()
     return train_df.loc[keep_mask], int((~keep_mask).sum())
 
 
@@ -292,10 +294,16 @@ class _Ctx:
     overfit_retention: float
     retention: Optional[float]
     sign_flipped: bool
+    train_significant: bool
+    test_significant: bool
+
+
+def _is_significant(stat: StatResult, significance_t: float) -> bool:
+    return bool(not np.isnan(stat.t_stat) and abs(stat.t_stat) >= significance_t)
 
 
 def _rule_no_insample_edge(ctx: _Ctx) -> Optional[Verdict]:
-    if ctx.train.significant:
+    if ctx.train_significant:
         return None
     return Verdict(
         "INSUFFICIENT_INSAMPLE_EDGE",
@@ -311,6 +319,17 @@ def _rule_no_insample_edge(ctx: _Ctx) -> Optional[Verdict]:
 # floor, it's a one-line change: add `abs(ctx.train.mean) > eps` to the
 # guard below -- the rule-table structure means that edit is isolated to
 # this one function and doesn't touch anything else in the pipeline.
+def _rule_test_uncomputable(ctx: _Ctx) -> Optional[Verdict]:
+    if np.isfinite(ctx.test.mean) and not np.isnan(ctx.test.t_stat):
+        return None
+    return Verdict(
+        "INSUFFICIENT_DATA",
+        f"test statistic could not be computed (n={ctx.test.n}, mean={ctx.test.mean}, t={ctx.test.t_stat}) -- "
+        "nothing to compare the in-sample edge against.",
+        None, False,
+    )
+
+
 def _rule_sign_flip(ctx: _Ctx) -> Optional[Verdict]:
     if not ctx.sign_flipped:
         return None
@@ -323,7 +342,7 @@ def _rule_sign_flip(ctx: _Ctx) -> Optional[Verdict]:
 
 
 def _rule_test_not_significant(ctx: _Ctx) -> Optional[Verdict]:
-    if ctx.test.significant:
+    if ctx.test_significant:
         return None
     if ctx.retention is not None and ctx.retention < ctx.overfit_retention:
         return Verdict(
@@ -389,6 +408,7 @@ def _rule_weak_default(ctx: _Ctx) -> Optional[Verdict]:
 
 _RULES: tuple[Callable[[_Ctx], Optional[Verdict]], ...] = (
     _rule_no_insample_edge,
+    _rule_test_uncomputable,
     _rule_sign_flip,
     _rule_test_not_significant,
     _rule_retention_undefined,
@@ -410,11 +430,13 @@ def classify_overfitting(
     Internally: build an immutable _Ctx, then walk _RULES in order and
     take the first non-None Verdict -- same semantics as the original
     if/elif chain, expressed as data (a tuple of rule functions) instead
-    of control flow."""
+    of control flow. significance_t is authoritative: significance is
+    recomputed from each StatResult's t_stat, not read from .significant."""
     sign_flipped = (train.mean > 0 > test.mean) or (train.mean < 0 < test.mean)
     retention = (test.mean / train.mean) if train.mean != 0 else None
     ctx = _Ctx(train, test, significance_t, robust_retention, moderate_retention, overfit_retention,
-               retention, sign_flipped)
+               retention, sign_flipped,
+               _is_significant(train, significance_t), _is_significant(test, significance_t))
     verdict = next(v for rule in _RULES if (v := rule(ctx)) is not None)
     return verdict.label, verdict.reasoning, verdict.retention_ratio, verdict.sign_flipped
 
