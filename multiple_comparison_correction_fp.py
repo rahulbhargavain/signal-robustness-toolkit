@@ -30,9 +30,15 @@ from __future__ import annotations
 import numpy as np
 
 
+def _check_alpha(alpha: float) -> None:
+    if not 0 < alpha < 1:
+        raise ValueError(f"alpha must be in (0, 1), got {alpha}")
+
+
 def bonferroni_correction(p_values: list[float], alpha: float = 0.05) -> list[bool]:
     """Reject at alpha/len(p_values) instead of alpha. Controls the
     family-wise error rate."""
+    _check_alpha(alpha)
     if not p_values:
         return []
     threshold = alpha / len(p_values)
@@ -44,6 +50,7 @@ def holm_correction(p_values: list[float], alpha: float = 0.05) -> list[bool]:
     against alpha/m, the next against alpha/(m-1), etc.; the first
     p-value that fails its threshold, and everything after it (in
     sorted order), is not rejected."""
+    _check_alpha(alpha)
     n = len(p_values)
     if n == 0:
         return []
@@ -67,6 +74,7 @@ def benjamini_hochberg_fdr(p_values: list[float], alpha: float = 0.05) -> list[b
     """Controls the expected false discovery rate. Sort ascending, find
     the largest rank k where p_(k) <= (k/m)*alpha, reject that one and
     everything below it."""
+    _check_alpha(alpha)
     n = len(p_values)
     if n == 0:
         return []
@@ -99,9 +107,11 @@ def summarize_correction(labels: list[str], p_values: list[float], alpha: float 
     alongside the corrected one."""
     if len(labels) != len(p_values):
         raise ValueError(f"labels ({len(labels)}) and p_values ({len(p_values)}) must be the same length")
+    if method not in _CORRECTIONS:
+        raise ValueError(f"method must be one of {sorted(_CORRECTIONS)}, got {method!r}")
     corrected = _CORRECTIONS[method](p_values, alpha)
     return [
         {"label": label, "p_value": p, "significant_uncorrected": p <= alpha,
          "significant_corrected": sig, "method": method, "n_tests": len(p_values)}
-        for label, p, sig in zip(labels, p_values, corrected)
+        for label, p, sig in zip(labels, p_values, corrected, strict=True)
     ]

@@ -160,6 +160,30 @@ class WalkForwardResult:
     n_embargoed_test: int = 0  # rows dropped from test by embargo_days (0 if embargo_days=0, the default)
 
 
+def date_sort_key(dates: pd.Series) -> pd.Series:
+    """The values rows are ORDERED by. datetime64 and numeric columns (e.g. a
+    fiscal-year int) are used as-is; anything else (str/object) must parse
+    as ISO-8601 -- sorting raw strings is lexicographic, so "15/01/2020"
+    would land after "01/02/2021", and a day-first vs. month-first guess
+    can silently scramble the timeline. Raises on missing dates rather than
+    letting NaT/NaN sort to the end and fall into the test window."""
+    dates = pd.Series(dates)
+    if pd.api.types.is_datetime64_any_dtype(dates) or pd.api.types.is_numeric_dtype(dates):
+        key = dates
+    else:
+        try:
+            key = pd.to_datetime(dates, format="ISO8601")
+        except (ValueError, TypeError) as e:
+            raise TypeError(
+                f"date column {dates.name!r} must be datetime-like, numeric, or ISO-8601 strings "
+                f"(e.g. '2020-01-31'); convert it first with pd.to_datetime(..., format=...). ({e})") from e
+    n_missing = int(key.isna().sum())
+    if n_missing:
+        raise ValueError(f"date column {dates.name!r} has {n_missing} missing value(s); drop or fill them first "
+                         "-- a row with no date can't be placed on either side of a split.")
+    return key
+
+
 def chronological_split(df: pd.DataFrame, date_col: str, train_frac: float = DEFAULT_TRAIN_FRAC
                          ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Sorts by date_col and splits by ROW COUNT (not by calendar span) --
@@ -179,11 +203,16 @@ def chronological_split(df: pd.DataFrame, date_col: str, train_frac: float = DEF
     this boundary leak. Snaps to whichever edge of the tied-date run is
     closer to the naive split_idx, to stay as close to train_frac as
     possible while keeping a whole cohort on one side."""
-    ordered = df.sort_values(date_col).reset_index(drop=True)
+    if not 0 < train_frac < 1:
+        raise ValueError(f"train_frac must be in (0, 1), got {train_frac}")
+    key = date_sort_key(df[date_col])
+    pos = np.argsort(key.to_numpy(), kind="stable")
+    ordered = df.iloc[pos].reset_index(drop=True)
+    ordered_key = key.iloc[pos].reset_index(drop=True)
     split_idx = int(len(ordered) * train_frac)
     if 0 < split_idx < len(ordered):
-        boundary_date = ordered[date_col].iloc[split_idx]
-        same_date_mask = (ordered[date_col] == boundary_date).to_numpy()
+        boundary_date = ordered_key.iloc[split_idx]
+        same_date_mask = (ordered_key == boundary_date).to_numpy()
         run_positions = np.flatnonzero(same_date_mask)
         if len(run_positions) and run_positions[0] < split_idx < run_positions[-1] + 1:
             run_start, run_end = int(run_positions[0]), int(run_positions[-1]) + 1
@@ -234,6 +263,32 @@ def apply_purge_embargo(train_df: pd.DataFrame, test_df: pd.DataFrame, date_col:
         embargoed_test = test_df.loc[keep_mask]
 
     return purged_train, embargoed_test, n_purged, n_embargoed
+
+
+def _align_to(index: pd.Index, groups, name: str = "cluster_groups") -> pd.Series:
+    """Lines per-row labels (cluster ids, dates) up with the values' rows. A
+    Series aligns by INDEX LABEL (so d["cl"] from the same frame just works);
+    anything else (ndarray, list) aligns by POSITION and must be the same
+    length. Previously a plain array was wrapped in a fresh 0..n-1 index and
+    then label-matched, which raised KeyError -- or silently mislabelled
+    rows -- whenever the frame's index wasn't 0..n-1 (every CPCV train frame)."""
+    if isinstance(groups, pd.Series):
+        missing = index.difference(groups.index)
+        if len(missing):
+            raise ValueError(f"{name} is a Series missing {len(missing)} of the values' index labels "
+                             f"(e.g. {list(missing[:3])}); pass it from the same frame, or as an array.")
+        return groups.loc[index]
+    arr = np.asarray(groups)
+    if len(arr) != len(index):
+        raise ValueError(f"{name} has length {len(arr)} but there are {len(index)} values.")
+    return pd.Series(arr, index=index)
+
+
+def _require_complete(groups: pd.Series, name: str = "cluster_groups") -> pd.Series:
+    n_missing = int(groups.isna().sum())
+    if n_missing:
+        raise ValueError(f"{name} has {n_missing} missing label(s) on rows being tested.")
+    return groups
 
 
 def _fit_ols(y: np.ndarray, x: pd.DataFrame, maxlags: int | None, cluster_groups: pd.Series | None):
@@ -287,7 +342,8 @@ def stat_vs_zero(values: pd.Series, dates: pd.Series | None = None, maxlags: int
     n = len(clean)
     if n < 2:
         return StatResult(mean=float(clean.mean()) if n else float("nan"), t_stat=float("nan"), n=n, significant=False)
-    cg = pd.Series(cluster_groups).loc[clean.index] if cluster_groups is not None else None
+    cg = (_require_complete(_align_to(pd.Series(values).index, cluster_groups).loc[clean.index])
+          if cluster_groups is not None else None)
     mean, t_stat, n_clusters = _t_from_ols_const(clean.to_numpy(dtype=float), dates, maxlags, cg)
     return _with_significance(StatResult(mean=mean, t_stat=t_stat, n=n, significant=False, n_clusters=n_clusters,
                                          df=_dof(n, 1, n_clusters)), significance_t)
@@ -303,9 +359,9 @@ def stat_group_diff(values: pd.Series, group_bool: pd.Series, dates: pd.Series |
     dates/maxlags."""
     df = pd.DataFrame({"value": values, "group": group_bool})
     if dates is not None:
-        df["date"] = dates
+        df["date"] = _align_to(df.index, dates, "dates")
     if cluster_groups is not None:
-        df["_cluster"] = pd.Series(cluster_groups)
+        df["_cluster"] = _align_to(df.index, cluster_groups)
     # See stat_vs_zero()'s comment: dropna() alone doesn't catch inf/-inf.
     df["value"] = df["value"].replace([np.inf, -np.inf], np.nan)
     df = df.dropna(subset=["value", "group"])
@@ -315,7 +371,7 @@ def stat_group_diff(values: pd.Series, group_bool: pd.Series, dates: pd.Series |
         return StatResult(mean=float("nan"), t_stat=float("nan"), n=n, significant=False)
     y = df["value"].astype(float).to_numpy()
     x = sm.add_constant(df["group"].astype(float))
-    cg = df["_cluster"] if cluster_groups is not None else None
+    cg = _require_complete(df["_cluster"]) if cluster_groups is not None else None
     model, n_clusters = _fit_ols(y, x, maxlags, cg)
     coef = float(model.params["group"])
     t_stat = float(model.tvalues["group"])
@@ -437,8 +493,8 @@ def walk_forward_validate(
             retention_ratio=None, sign_flipped=False, verdict="INSUFFICIENT_DATA",
             reasoning=f"train n={len(train_df)}, test n={len(test_df)} -- need >= {min_n_per_split} per split "
                       "for either stat to be meaningful."
-                      + (f" ({n_purged_train} train row(s) purged, {n_embargoed_test} test row(s) embargoed.)"
-                         if n_purged_train or n_embargoed_test else ""),
+                      + (f" ({n_purged_train} train row(s) purged, {n_embargoed_test} test row(s) embargoed "
+                         "-- see purge_days/embargo_days.)" if n_purged_train or n_embargoed_test else ""),
             n_purged_train=n_purged_train, n_embargoed_test=n_embargoed_test,
         )
 

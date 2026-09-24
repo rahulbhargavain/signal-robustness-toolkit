@@ -1,3 +1,4 @@
 __pycache__/
 .pytest_cache/
 signal_robustness_toolkit.egg-info/
+.ruff_cache/

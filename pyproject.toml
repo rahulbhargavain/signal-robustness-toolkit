@@ -18,6 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
+lint = ["ruff>=0.5"]
 
 [tool.setuptools]
 py-modules = [
@@ -31,3 +32,10 @@ py-modules = [
 [tool.pytest.ini_options]
 testpaths = ["tests", "tests_fp"]
 pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "B"]

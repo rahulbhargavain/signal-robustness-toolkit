@@ -69,6 +69,19 @@ statistic's own degrees of freedom (n−1, n−2, or G−1 for G clusters) rathe
 fixed |t| ≥ 2.0, which over-rejects on small splits. Pass `significance_t=2.0` (or
 any float) for a fixed threshold.
 
+Input conventions the validators enforce:
+
+- **Dates:** `date_col` must be datetime-like, numeric (e.g. a fiscal year), or ISO-8601
+  strings (`"2020-01-31"`). Other strings such as `"15/01/2020"` raise a `TypeError`
+  rather than being sorted as text, and missing dates raise a `ValueError`. Convert
+  with `pd.to_datetime(..., format=...)` first.
+- **`cluster_groups` / `dates`:** a pandas Series lines up with the values by index label
+  (so `d["cluster"]` from the same frame just works); an array or list lines up by
+  position and must be the same length.
+- **Purge/embargo in CPCV:** each held-out block purges train rows within `purge_days`
+  on both sides, embargoes test rows within `embargo_days` of the block's start, and
+  embargoes the `embargo_days` of train rows after the post-block purge.
+
 ```python
 import walk_forward_validator as wfv
 
@@ -136,13 +149,16 @@ pipeline. Pick whichever style fits your own codebase; both are maintained.
 ## Testing
 
 ```bash
-pip install -e ".[test]"
+pip install -e ".[test,lint]"
 python -m pytest -q
+ruff check .
 ```
 
-425 tests, no external services, no API keys, no network access required.
-GitHub Actions runs the suite on Python 3.10–3.13 for every push to `main` and every
-pull request (`.github/workflows/tests.yml`).
+629 tests, no external services, no API keys, no network access required.
+`tests/test_parity_orig_vs_fp.py` checks on randomized inputs that each original module
+and its FP rewrite return identical results, reasoning text included. GitHub Actions runs
+`ruff` and the test suite on Python 3.10–3.13 for every push to `main` and every pull
+request (`.github/workflows/tests.yml`).
 
 ## License
 

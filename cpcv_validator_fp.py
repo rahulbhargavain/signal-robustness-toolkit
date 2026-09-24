@@ -47,9 +47,11 @@ import pandas as pd
 
 from walk_forward_validator_fp import (
     DEFAULT_MIN_N_PER_SPLIT,
+    MIN_RELIABLE_CLUSTERS,
     StatResult,
     apply_purge_embargo,
     classify_overfitting,
+    date_sort_key,
 )
 
 DEFAULT_N_GROUPS = 6
@@ -130,17 +132,18 @@ def assign_groups(df: pd.DataFrame, date_col: str, n_groups: int) -> pd.Series:
     df's original index."""
     if df.empty or n_groups < 2:
         return pd.Series([], dtype=int)
-    ordered = df.sort_values(date_col)
-    dates = pd.to_datetime(ordered[date_col]).to_numpy()
-    n = len(ordered)
+    key = date_sort_key(df[date_col])
+    pos = np.argsort(key.to_numpy(), kind="stable")
+    dates = key.to_numpy()[pos]
+    n = len(df)
     n_groups = min(n_groups, n)
     raw_cuts = [int(round(n * i / n_groups)) for i in range(1, n_groups)]
     snapped_cuts = sorted(set(c for c in (_snap_cut(dates, cut, n) for cut in raw_cuts) if 0 < c < n))
 
     group_id = np.zeros(n, dtype=int)
-    for gid, (start, end) in enumerate(zip([0] + snapped_cuts, snapped_cuts + [n])):
+    for gid, (start, end) in enumerate(zip([0] + snapped_cuts, snapped_cuts + [n], strict=True)):
         group_id[start:end] = gid
-    return pd.Series(group_id, index=ordered.index)
+    return pd.Series(group_id, index=df.index[pos])
 
 
 def generate_cpcv_splits(n_groups: int, n_test_groups: int):
@@ -166,16 +169,23 @@ def _contiguous_runs(sorted_group_ids: list[int]) -> list[list[int]]:
     return runs
 
 
-def _purge_after_run(train_df: pd.DataFrame, date_col: str, run_end, purge_days: int
-                      ) -> tuple[pd.DataFrame, int]:
-    """Pure: drops train rows dated within purge_days AFTER a held-out
-    run's last test date (the last test row's forward window runs to
-    run_end + purge_days) -- the mirror image of the pre-boundary purge."""
-    if purge_days <= 0 or train_df.empty:
-        return train_df, 0
+def _purge_after_run(train_df: pd.DataFrame, date_col: str, run_end, purge_days: int,
+                      embargo_days: int = 0) -> tuple[pd.DataFrame, int, int]:
+    """Train rows dated AFTER a held-out run, the mirror image of the
+    pre-boundary purge. The last test row's forward-return window runs to
+    run_end + purge_days, so train rows dated in (run_end, run_end +
+    purge_days] overlap a test outcome and are PURGED; rows in the next
+    embargo_days after that are EMBARGOED (Lopez de Prado's embargo: a
+    buffer after the test set against serial correlation leaking test
+    information into later train rows). Returns (kept, n_purged, n_embargoed)."""
+    if (purge_days <= 0 and embargo_days <= 0) or train_df.empty:
+        return train_df, 0, 0
     train_dates = pd.to_datetime(train_df[date_col])
-    drop_mask = ((train_dates > run_end) & (train_dates <= run_end + pd.Timedelta(days=purge_days))).to_numpy()
-    return train_df.loc[~drop_mask], int(drop_mask.sum())
+    purge_end = run_end + pd.Timedelta(days=max(purge_days, 0))
+    embargo_end = purge_end + pd.Timedelta(days=max(embargo_days, 0))
+    purge_mask = ((train_dates > run_end) & (train_dates <= purge_end)).to_numpy()
+    embargo_mask = ((train_dates > purge_end) & (train_dates <= embargo_end)).to_numpy()
+    return train_df.loc[~(purge_mask | embargo_mask)], int(purge_mask.sum()), int(embargo_mask.sum())
 
 
 def _run_drops(train_df: pd.DataFrame, train_dates: pd.Series, run_test_df: pd.DataFrame, date_col: str,
@@ -190,9 +200,15 @@ def _run_drops(train_df: pd.DataFrame, train_dates: pd.Series, run_test_df: pd.D
     after = train_df.loc[train_dates.loc[train_df.index] > run_end]
     kept_before, kept_test, n_before, n_embargoed = apply_purge_embargo(
         before, run_test_df, date_col, purge_days=purge_days, embargo_days=embargo_days)
-    kept_after, n_after = _purge_after_run(after, date_col, run_end, purge_days)
+    kept_after, n_after, n_embargoed_after = _purge_after_run(after, date_col, run_end, purge_days, embargo_days)
     drop_train = before.index.difference(kept_before.index).union(after.index.difference(kept_after.index))
-    return drop_train, run_test_df.index.difference(kept_test.index), n_before + n_after, n_embargoed
+    return (drop_train, run_test_df.index.difference(kept_test.index), n_before + n_after,
+            n_embargoed + n_embargoed_after)
+
+
+def _sort_by_date(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
+    """Stable chronological row order, index labels kept."""
+    return df.iloc[np.argsort(date_sort_key(df[date_col]).to_numpy(), kind="stable")]
 
 
 def build_split_frames(df: pd.DataFrame, date_col: str, group_labels: pd.Series,
@@ -202,7 +218,12 @@ def build_split_frames(df: pd.DataFrame, date_col: str, group_labels: pd.Series,
     """Slices df into (train, test) for one CPCV combinatorial split, then
     applies purge/embargo at EVERY contiguous test-run boundary, leading
     (purge + test embargo via walk_forward_validator_fp.apply_purge_embargo())
-    and trailing (_purge_after_run())."""
+    and trailing (_purge_after_run(): purge, then an embargo on the train
+    rows after it). n_embargoed counts embargoed test AND train rows."""
+    # Row order matters: a HAC (maxlags) stat_fn treats adjacent rows as
+    # adjacent in time, so frames are handed over date-sorted whatever the
+    # caller's input order.
+    df = _sort_by_date(df, date_col)
     train_df = df.loc[group_labels.isin(train_groups)]
     test_df = df.loc[group_labels.isin(test_groups)]
     if test_df.empty or (purge_days <= 0 and embargo_days <= 0):
@@ -336,6 +357,22 @@ def _evaluate_one_path(df: pd.DataFrame, date_col: str, group_labels: pd.Series,
                            retention_ratio=retention, sign_flipped=sign_flipped, verdict=verdict)
 
 
+def _low_cluster_caveat(paths: list) -> str:
+    """Same warning walk_forward_validate() appends: cluster-robust SEs with
+    fewer than MIN_RELIABLE_CLUSTERS distinct clusters aren't reliable, so
+    say how many paths relied on them instead of letting the aggregate
+    verdict look fully trustworthy."""
+    counts = [s.n_clusters for p in paths for s in (p.train, p.test) if s.n_clusters is not None]
+    low = [p for p in paths
+           if any(s.n_clusters is not None and s.n_clusters < MIN_RELIABLE_CLUSTERS for s in (p.train, p.test))]
+    if not low:
+        return ""
+    return (f" CAVEAT: {len(low)} of {len(paths)} evaluated path(s) used cluster-robust SEs with fewer than "
+            f"{MIN_RELIABLE_CLUSTERS} distinct clusters (as few as {min(counts)}) -- the sandwich estimator is not "
+            "asymptotically reliable at this count, so this verdict should be treated as inconclusive, not "
+            "trusted at face value.")
+
+
 def cpcv_validate(df: pd.DataFrame, date_col: str, stat_fn,
                    n_groups: int = DEFAULT_N_GROUPS, n_test_groups: int = DEFAULT_N_TEST_GROUPS,
                    purge_days: int = 0, embargo_days: int = 0,
@@ -378,4 +415,4 @@ def cpcv_validate(df: pd.DataFrame, date_col: str, stat_fn,
                        n_splits_skipped=n_skipped, pct_paths_robust_or_moderate=pct,
                        median_retention=median_retention, overall_verdict=overall_verdict,
                        reasoning=reasoning + (f" ({n_skipped} split(s) skipped for insufficient data.)"
-                                              if n_skipped else ""))
+                                              if n_skipped else "") + _low_cluster_caveat(paths))
